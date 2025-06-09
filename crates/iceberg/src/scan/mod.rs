@@ -24,6 +24,7 @@ use context::*;
 mod task;
 
 use std::sync::Arc;
+use std::future::Future;
 
 use arrow_array::RecordBatch;
 use futures::channel::mpsc::{Sender, channel};
@@ -37,7 +38,7 @@ use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluato
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::FileIO;
 use crate::runtime::spawn;
-use crate::spec::{DataContentType, SnapshotRef};
+use crate::spec::{DataContentType, ManifestEntryRef, SnapshotRef};
 use crate::table::Table;
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind, Result};
@@ -352,6 +353,26 @@ pub struct TableScan {
 impl TableScan {
     /// Returns a stream of [`FileScanTask`]s.
     pub async fn plan_files(&self) -> Result<FileScanTaskStream> {
+        self.plan_files_with_processors(
+            Self::process_data_manifest_entry,
+            Self::process_delete_manifest_entry,
+        )
+        .await
+    }
+
+    /// Returns a stream of tasks with custom processors.
+    pub async fn plan_files_with_processors<T, DataProcessor, DeleteProcessor, DataFut, DeleteFut>(
+        &self,
+        data_processor: DataProcessor,
+        delete_processor: DeleteProcessor,
+    ) -> Result<BoxStream<'static, Result<T>>>
+    where
+        T: Send + 'static,
+        DataProcessor: Fn(ManifestEntryContext, Sender<Result<T>>) -> DataFut + Send + Sync + 'static + Clone,
+        DataFut: Future<Output = Result<()>> + Send + 'static,
+        DeleteProcessor: Fn(ManifestEntryContext, Sender<DeleteFileContext>) -> DeleteFut + Send + Sync + 'static + Clone,
+        DeleteFut: Future<Output = Result<()>> + Send + 'static,
+    {
         let Some(plan_context) = self.plan_context.as_ref() else {
             return Ok(Box::pin(futures::stream::empty()));
         };
@@ -409,51 +430,105 @@ impl TableScan {
             let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
             // Process the delete file [`ManifestEntry`] stream in parallel
-            spawn(async move {
-                let result = manifest_entry_delete_ctx_rx
-                    .map(|me_ctx| Ok((me_ctx, delete_file_tx.clone())))
-                    .try_for_each_concurrent(
-                        concurrency_limit_manifest_entries,
-                        |(manifest_entry_context, tx)| async move {
-                            spawn(async move {
-                                Self::process_delete_manifest_entry(manifest_entry_context, tx)
+            spawn({
+                let delete_processor = Arc::new(delete_processor);
+                async move {
+                    let result = manifest_entry_delete_ctx_rx
+                        .map(|me_ctx| Ok((me_ctx, delete_file_tx.clone())))
+                        .try_for_each_concurrent(
+                            concurrency_limit_manifest_entries,
+                            |(manifest_entry_context, tx)| {
+                                let processor = delete_processor.clone();
+                                async move {
+                                    spawn(async move {
+                                        processor(manifest_entry_context, tx).await
+                                    })
                                     .await
-                            })
-                            .await
-                        },
-                    )
-                    .await;
-
-                if let Err(error) = result {
-                    let _ = channel_for_delete_manifest_entry_error
-                        .send(Err(error))
+                                }
+                            },
+                        )
                         .await;
+
+                    if let Err(error) = result {
+                        let _ = channel_for_delete_manifest_entry_error
+                            .send(Err(error))
+                            .await;
+                    }
                 }
             })
             .await;
         }
 
         // Process the data file [`ManifestEntry`] stream in parallel
-        spawn(async move {
-            let result = manifest_entry_data_ctx_rx
-                .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
-                .try_for_each_concurrent(
-                    concurrency_limit_manifest_entries,
-                    |(manifest_entry_context, tx)| async move {
-                        spawn(async move {
-                            Self::process_data_manifest_entry(manifest_entry_context, tx).await
-                        })
-                        .await
-                    },
-                )
-                .await;
+        spawn({
+            let data_processor = Arc::new(data_processor);
+            async move {
+                let result = manifest_entry_data_ctx_rx
+                    .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
+                    .try_for_each_concurrent(
+                        concurrency_limit_manifest_entries,
+                        |(manifest_entry_context, tx)| {
+                            let processor = data_processor.clone();
+                            async move {
+                                spawn(async move {
+                                    processor(manifest_entry_context, tx).await
+                                })
+                                .await
+                            }
+                        },
+                    )
+                    .await;
 
-            if let Err(error) = result {
-                let _ = channel_for_data_manifest_entry_error.send(Err(error)).await;
+                if let Err(error) = result {
+                    let _ = channel_for_data_manifest_entry_error.send(Err(error)).await;
+                }
             }
         });
 
         Ok(file_scan_task_rx.boxed())
+    }
+
+    /// Returns all manifest entries encountered during file planning.
+    /// This includes both data and delete manifest entries.
+    pub async fn get_manifest_entries(&self) -> Result<Vec<ManifestEntryRef>> {
+        use futures::TryStreamExt;
+        use std::sync::{Arc, Mutex};
+        
+        let delete_entries = Arc::new(Mutex::new(Vec::new()));
+        let delete_entries_clone = delete_entries.clone();
+        
+        let stream = self.plan_files_with_processors(
+            // Data processor - collect data manifest entries through the main stream
+            |manifest_entry_context, mut sender| async move {
+                sender.send(Ok(manifest_entry_context.manifest_entry.clone())).await?;
+                Ok(())
+            },
+            // Delete processor - collect delete manifest entries through shared state
+            move |manifest_entry_context, _sender| {
+                let entries = delete_entries_clone.clone();
+                async move {
+                    if let Ok(mut entries_guard) = entries.lock() {
+                        entries_guard.push(manifest_entry_context.manifest_entry.clone());
+                    }
+                    Ok(())
+                }
+            },
+        ).await?;
+        
+        // Collect data entries from the main stream
+        let data_entries: Vec<ManifestEntryRef> = stream.try_collect().await?;
+        
+        // Extract delete entries from shared state
+        let delete_entries = if let Ok(entries) = Arc::try_unwrap(delete_entries) {
+            entries.into_inner().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        
+        // Combine both data and delete entries
+        let mut all_entries = data_entries;
+        all_entries.extend(delete_entries);
+        Ok(all_entries)
     }
 
     /// Returns an [`ArrowRecordBatchStream`].

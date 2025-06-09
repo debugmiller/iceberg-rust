@@ -22,6 +22,8 @@ use std::vec;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::common::stats::Precision;
+use datafusion::common::Statistics;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -31,6 +33,8 @@ use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProp
 use datafusion::prelude::Expr;
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
+use iceberg::scan::TableScan;
+use iceberg::spec::ManifestStatus;
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
@@ -40,10 +44,6 @@ use crate::to_datafusion_error;
 /// necessary details and computed properties required for execution planning.
 #[derive(Debug)]
 pub(crate) struct IcebergTableScan {
-    /// A table in the catalog.
-    table: Table,
-    /// Snapshot of the table to scan.
-    snapshot_id: Option<i64>,
     /// Stores certain, often expensive to compute,
     /// plan properties used in query optimization.
     plan_properties: PlanProperties,
@@ -51,11 +51,14 @@ pub(crate) struct IcebergTableScan {
     projection: Option<Vec<String>>,
     /// Filters to apply to the table scan
     predicates: Option<Predicate>,
+
+    table_scan: Arc<TableScan>,
+    statistics: Statistics,
 }
 
 impl IcebergTableScan {
     /// Creates a new [`IcebergTableScan`] object.
-    pub(crate) fn new(
+    pub(crate) async fn new(
         table: Table,
         snapshot_id: Option<i64>,
         schema: ArrowSchemaRef,
@@ -70,14 +73,19 @@ impl IcebergTableScan {
         let projection = get_column_names(schema.clone(), projection);
         let predicates = convert_filters_to_predicate(filters);
 
+        let table_scan = plan(table.clone(), snapshot_id, projection.clone(), predicates.clone()).await.unwrap();
+        let table_scan = Arc::new(table_scan);
+        let statistics = get_statistics(filters, table_scan.clone(), schema.clone()).await.unwrap();
+
         Self {
-            table,
-            snapshot_id,
             plan_properties,
             projection,
             predicates,
+            table_scan,
+            statistics,
         }
     }
+
 
     /// Computes [`PlanProperties`] used in query optimization.
     fn compute_properties(schema: ArrowSchemaRef) -> PlanProperties {
@@ -122,18 +130,17 @@ impl ExecutionPlan for IcebergTableScan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let fut = get_batch_stream(
-            self.table.clone(),
-            self.snapshot_id,
-            self.projection.clone(),
-            self.predicates.clone(),
-        );
+        let fut = get_batch_stream(self.table_scan.clone());
         let stream = futures::stream::once(fut).try_flatten();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
             stream,
         )))
+    }
+
+    fn statistics(&self) -> DFResult<Statistics> {
+        Ok(self.statistics.clone())
     }
 }
 
@@ -162,11 +169,25 @@ impl DisplayAs for IcebergTableScan {
 /// This function initializes a [`TableScan`], builds it,
 /// and then converts it into a stream of Arrow [`RecordBatch`]es.
 async fn get_batch_stream(
+    table_scan: Arc<TableScan>,
+) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+
+    let stream = table_scan
+        .to_arrow()
+        .await
+        .map_err(to_datafusion_error)?
+        .map_err(to_datafusion_error);
+    Ok(Box::pin(stream))
+}
+
+const CONCURRENCY_LIMIT: usize = 20;
+
+pub async fn plan(
     table: Table,
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
     predicates: Option<Predicate>,
-) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+) -> DFResult<TableScan> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
         None => table.scan(),
@@ -179,14 +200,34 @@ async fn get_batch_stream(
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
     }
+    scan_builder = scan_builder.with_manifest_entry_concurrency_limit(CONCURRENCY_LIMIT)
+        .with_data_file_concurrency_limit(CONCURRENCY_LIMIT)
+        .with_concurrency_limit(CONCURRENCY_LIMIT);
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
-    let stream = table_scan
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)?
-        .map_err(to_datafusion_error);
-    Ok(Box::pin(stream))
+    Ok(table_scan)
+}
+
+pub async fn get_statistics(
+    filters: &[Expr],
+    table_scan: Arc<TableScan>,
+    schema: ArrowSchemaRef,
+) -> DFResult<Statistics> {
+    if filters.len() > 0 {
+        return Ok(Statistics::new_unknown(&schema));
+    }
+
+    let manifest_entries = table_scan.get_manifest_entries().await.map_err(to_datafusion_error)?;
+
+    let mut num_rows = 0;
+    for manifest_entry in manifest_entries {
+        if manifest_entry.status == ManifestStatus::Deleted {
+            return Ok(Statistics::new_unknown(&schema));
+        }
+        num_rows += manifest_entry.data_file.record_count();
+    }
+    Ok(Statistics::new_unknown(&schema)
+        .with_num_rows(Precision::Exact(num_rows as usize)))
 }
 
 fn get_column_names(

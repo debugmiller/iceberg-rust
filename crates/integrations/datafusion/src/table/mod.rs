@@ -135,8 +135,8 @@ impl TableProvider for IcebergTableProvider {
             self.snapshot_id,
             self.schema.clone(),
             projection,
-            filters,
-        )))
+            &filters,
+        ).await))
     }
 
     fn supports_filters_pushdown(

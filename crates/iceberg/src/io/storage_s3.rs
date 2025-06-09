@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 
 use opendal::services::S3Config;
+use opendal::layers::TracingLayer;
 use opendal::{Configurator, Operator};
 use url::Url;
 
@@ -166,5 +167,5 @@ pub(crate) fn s3_config_build(cfg: &S3Config, path: &str) -> Result<Operator> {
         // Set bucket name.
         .bucket(bucket);
 
-    Ok(Operator::new(builder)?.finish())
+    Ok(Operator::new(builder)?.layer(TracingLayer).finish())
 }
