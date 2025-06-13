@@ -33,7 +33,7 @@ use iceberg::{
 };
 use typed_builder::TypedBuilder;
 
-use crate::utils::{create_metadata_location, create_sdk_config};
+use crate::utils::{create_metadata_location, create_sdk_config, parse_version};
 
 /// S3Tables catalog configuration.
 #[derive(Debug, TypedBuilder)]
@@ -476,12 +476,65 @@ impl Catalog for S3TablesCatalog {
     /// Updates an existing table within the s3tables catalog.
     ///
     /// This function is still in development and will always return an error.
-    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Updating a table is not supported yet",
-        ))
-    }
+    async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
+        let req = self
+            .s3tables_client
+            .get_table()
+            .table_bucket_arn(self.config.table_bucket_arn.clone())
+            .namespace(commit.identifier().namespace().to_url_string())
+            .name(commit.identifier().name());
+        let resp: GetTableOutput = req.send().await.map_err(from_aws_sdk_error)?;
+        let version_token = resp.version_token().to_string();
+        let current_metadata_location = resp.metadata_location().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Table {} does not have metadata location", commit.identifier().name()),
+            )
+        })?;
+        let warehouse_location = resp.warehouse_location();
+
+        let input_file = self.file_io.new_input(current_metadata_location)?;
+        let metadata_content = input_file.read().await?;
+        let current_metadata = serde_json::from_slice::<TableMetadata>(&metadata_content)?;
+        
+        for requirement in commit.take_requirements() {
+            requirement.check(Some(&current_metadata))?;
+        }
+
+        let mut metadata_builder: TableMetadataBuilder = TableMetadataBuilder::new_from_metadata(
+            current_metadata.clone(),
+            Some(current_metadata_location.to_string()),
+        );
+
+        for update in commit.take_updates() {
+            metadata_builder = update.apply(metadata_builder)?;
+        }
+        let updated_metadata = metadata_builder.build()?.metadata;
+
+        let new_metadata_location = create_metadata_location(&warehouse_location, parse_version(&current_metadata_location)? + 1)?;
+
+        self.file_io
+            .new_output(&new_metadata_location)?
+            .write(serde_json::to_vec(&updated_metadata)?.into())
+            .await?;
+
+        let req = self
+            .s3tables_client
+            .update_table_metadata_location()
+            .table_bucket_arn(self.config.table_bucket_arn.clone())
+            .namespace(commit.identifier().namespace().to_url_string())
+            .name(commit.identifier().name())
+            .metadata_location(new_metadata_location.clone())
+            .version_token(version_token);
+
+        req.send().await.map_err(from_aws_sdk_error)?;
+        Ok(Table::builder()
+            .file_io(self.file_io.clone())
+            .metadata_location(new_metadata_location)
+            .metadata(updated_metadata.clone())
+            .identifier(commit.identifier().clone())
+            .build()?)
+        }
 }
 
 /// Format AWS SDK error into iceberg error

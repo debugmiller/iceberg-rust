@@ -98,3 +98,18 @@ pub(crate) fn create_metadata_location(
 
     Ok(metadata_location)
 }
+
+pub(crate) fn parse_version(metadata_location: &str) -> Result<i32> {
+    let version_start = 1 + metadata_location.rfind('/').ok_or(
+        Error::new(ErrorKind::Unexpected, format!("Unable to parse version from metadata location: {}", metadata_location))
+    )?;
+    let version_end = version_start + metadata_location[version_start..].find('-').ok_or(
+        Error::new(ErrorKind::Unexpected, format!("Unable to parse version from metadata location: {}", metadata_location))
+    )?;
+
+    let version = metadata_location[version_start..version_end].parse::<i32>().map_err(
+        |e| Error::new(ErrorKind::Unexpected, format!("Unable to parse version from metadata location: {}", metadata_location)).with_source(e)
+    )?;
+    Ok(version)
+  }
+
