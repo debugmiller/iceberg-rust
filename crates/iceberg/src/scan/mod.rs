@@ -361,7 +361,7 @@ impl TableScan {
     }
 
     /// Returns a stream of tasks with custom processors.
-    pub async fn plan_files_with_processors<T, DataProcessor, DeleteProcessor, DataFut, DeleteFut>(
+    pub(crate) async fn plan_files_with_processors<T, DataProcessor, DeleteProcessor, DataFut, DeleteFut>(
         &self,
         data_processor: DataProcessor,
         delete_processor: DeleteProcessor,
