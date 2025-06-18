@@ -22,16 +22,25 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::common::DFSchema;
+use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::parquet::DefaultParquetFileReaderFactory;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::catalog::Session;
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::logical_expr::utils::conjunction;
+use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
+use datafusion::execution::object_store::ObjectStoreUrl;
+use object_store_opendal::OpendalStore;
 
-use crate::physical_plan::scan::IcebergTableScan;
+use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
+use crate::physical_plan::scan::{plan, IcebergTableScan};
 
 /// Represents a [`TableProvider`] for the Iceberg [`Catalog`],
 /// managing access to a [`Table`].
@@ -107,6 +116,24 @@ impl IcebergTableProvider {
             schema,
         })
     }
+
+    fn filters_to_predicate(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+    ) -> DFResult<Arc<dyn PhysicalExpr>> {
+        let df_schema = DFSchema::try_from(self.schema())?;
+
+        let predicate = conjunction(filters.to_vec());
+        let predicate = predicate
+            .map(|predicate| state.create_physical_expr(predicate, &df_schema))
+            .transpose()?
+            // if there are no filters, use a literal true to have a predicate
+            // that always evaluates to true we can pass to the index
+            .unwrap_or_else(|| datafusion::physical_expr::expressions::lit(true));
+
+        Ok(predicate)
+    }
 }
 
 #[async_trait]
@@ -125,18 +152,82 @@ impl TableProvider for IcebergTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(IcebergTableScan::new(
-            self.table.clone(),
-            self.snapshot_id,
-            self.schema.clone(),
-            projection,
-            &filters,
-        ).await))
+        let output_schema = match projection {
+            None => self.schema.clone(),
+            Some(projection) => Arc::new(self.schema.project(projection).unwrap()),
+        };
+    
+        let iceberg_projection = get_column_names(output_schema.clone(), projection);
+        let predicates = convert_filters_to_predicate(filters);
+
+        let table_scan = plan(self.table.clone(), self.snapshot_id, iceberg_projection.clone(), predicates.clone()).await.unwrap();
+        let manifest_entries = table_scan.get_manifest_entries().await.unwrap();
+
+        let mut file_groups = vec![];
+        for manifest_entry in manifest_entries.iter() {
+            let file_path = manifest_entry.file_path().split("s3://").nth(1).expect("Failed to get file path");
+            let file_path = file_path.split_once("/").expect("Failed to get file path").1;
+            let partitioned_file = PartitionedFile::new(file_path.to_string(), manifest_entry.file_size_in_bytes());
+            file_groups.push(FileGroup::new(vec![partitioned_file]));
+        }
+
+        let predicate = self.filters_to_predicate(state, filters)?;
+
+        // Prepare for scanning
+        let schema = self.schema();
+
+        let md = self.table.metadata().location().to_string();
+
+        // keep only protocol and host, drop the path
+        let url_parts: Vec<&str> = md.split("://").collect();
+        if url_parts.len() != 2 {
+            return Err(DataFusionError::External(Box::new(Error::new(
+                ErrorKind::Unexpected,
+                format!("Invalid URL format: {}", md),
+            ))));
+        }
+        let protocol = url_parts[0];
+        let rest = url_parts[1];
+        let host = rest.split('/').next().unwrap_or(rest);
+        let prefix = format!("{}://{}", protocol, host);
+
+        let object_store_url = ObjectStoreUrl::parse(prefix.clone())?;
+        let object_store = Arc::new(OpendalStore::new(self.table.file_io().operator(prefix + "/").expect("Failed to get operator")));
+
+        // TODO Configure a factory interface to avoid re-reading the metadata for each file
+        let reader_factory =
+            DefaultParquetFileReaderFactory::new(object_store);
+
+        let file_source: Arc<ParquetSource> = Arc::new(
+            ParquetSource::default()
+                // provide the predicate so the DataSourceExec can try and prune
+                // row groups internally
+                .with_predicate(schema.clone(), predicate)
+                // provide the factory to create parquet reader without re-reading metadata
+                .with_parquet_file_reader_factory(Arc::new(reader_factory)),
+        );
+        let file_scan_config =
+            FileScanConfigBuilder::new(object_store_url, schema, file_source)
+                .with_limit(limit)
+                .with_projection(projection.cloned())
+                .with_file_groups(file_groups)
+                .build();
+
+        // Finally, put it all together into a DataSourceExec
+        Ok(DataSourceExec::from_data_source(file_scan_config))
+
+        // Ok(Arc::new(IcebergTableScan::new(
+        //     self.table.clone(),
+        //     self.snapshot_id,
+        //     self.schema.clone(),
+        //     projection,
+        //     &filters,
+        // ).await))
     }
 
     fn supports_filters_pushdown(
@@ -147,6 +238,17 @@ impl TableProvider for IcebergTableProvider {
         // Push down all filters, as a single source of truth, the scanner will drop the filters which couldn't be push down
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
+}
+
+fn get_column_names(
+    schema: ArrowSchemaRef,
+    projection: Option<&Vec<usize>>,
+) -> Option<Vec<String>> {
+    projection.map(|v| {
+        v.iter()
+            .map(|p| schema.field(*p).name().clone())
+            .collect::<Vec<String>>()
+    })
 }
 
 #[cfg(test)]

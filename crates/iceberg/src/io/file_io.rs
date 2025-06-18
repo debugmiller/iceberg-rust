@@ -59,6 +59,12 @@ impl FileIO {
         self.builder
     }
 
+    /// Get the operator for the given path.
+    pub fn operator(&self, path: impl AsRef<str>) -> crate::Result<Operator> {
+        let (op, _) = self.inner.create_operator(&path)?;
+        Ok(op)
+    }
+
     /// Try to infer file io scheme from path. See [`FileIO`] for supported schemes.
     ///
     /// - If it's a valid url, for example `s3://bucket/a`, url scheme will be used, and the rest of the url will be ignored.
@@ -116,7 +122,7 @@ impl FileIO {
     /// - If the path is a non-empty directory, this function will remove the directory and all nested files and directories.
     pub async fn remove_dir_all(&self, path: impl AsRef<str>) -> Result<()> {
         let (op, relative_path) = self.inner.create_operator(&path)?;
-        let path = if relative_path.ends_with('/') {
+        let path: String = if relative_path.ends_with('/') {
             relative_path.to_string()
         } else {
             format!("{relative_path}/")
