@@ -40,7 +40,7 @@ use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
     NestedFieldRef, PartitionSpec, PrimitiveType, Schema, SchemaRef, SchemaVisitor, Struct,
-    StructType, TableMetadata, Type, visit_schema,
+    StructType, TableMetadata, Type, VariantType, visit_schema,
 };
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
@@ -204,6 +204,10 @@ impl SchemaVisitor for IndexByParquetPathName {
             self.name_to_id.insert(full_name, field_id);
         }
 
+        Ok(())
+    }
+
+    fn variant(&mut self, _v: &VariantType) -> Result<Self::T> {
         Ok(())
     }
 }

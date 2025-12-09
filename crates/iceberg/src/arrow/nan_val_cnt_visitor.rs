@@ -28,7 +28,7 @@ use crate::Result;
 use crate::arrow::{ArrowArrayAccessor, FieldMatchMode};
 use crate::spec::{
     ListType, MapType, NestedFieldRef, PrimitiveType, Schema, SchemaRef, SchemaWithPartnerVisitor,
-    StructType, visit_struct_with_partner,
+    StructType, visit_struct_with_partner, VariantType,
 };
 
 macro_rules! cast_and_update_cnt_map {
@@ -143,6 +143,10 @@ impl SchemaWithPartnerVisitor<ArrayRef> for NanValueCountVisitor {
     fn after_map_value(&mut self, field: &NestedFieldRef, partner: &ArrayRef) -> Result<()> {
         let field_id = field.id;
         count_float_nans!(partner, self, field_id);
+        Ok(())
+    }
+
+    fn variant(&mut self, _v: &VariantType, _partner: &ArrayRef) -> Result<Self::T> {
         Ok(())
     }
 }

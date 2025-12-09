@@ -596,6 +596,12 @@ impl Literal {
                     ))
                 }
             }
+            Type::Variant(_) => {
+                Err(Error::new(
+                    crate::ErrorKind::DataInvalid,
+                    "Cannot convert variant to json value.",
+                ))
+            }
         }
     }
 

@@ -624,6 +624,9 @@ impl ArrowReader {
                 Self::include_leaf_field_id(&map_type.key_field, field_ids);
                 Self::include_leaf_field_id(&map_type.value_field, field_ids);
             }
+            Type::Variant(_) => {
+                field_ids.push(field.id);
+            }
         }
     }
 

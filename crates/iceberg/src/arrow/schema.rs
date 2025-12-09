@@ -28,6 +28,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
 use num_bigint::BigInt;
+use parquet::variant::VariantType;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::statistics::Statistics;
 use rust_decimal::prelude::ToPrimitive;
@@ -442,6 +443,7 @@ enum ArrowSchemaOrFieldOrType {
     Schema(ArrowSchema),
     Field(Field),
     Type(DataType),
+    Variant(VariantType),
 }
 
 impl SchemaVisitor for ToArrowSchemaConverter {
@@ -636,6 +638,10 @@ impl SchemaVisitor for ToArrowSchemaConverter {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::LargeBinary))
             }
         }
+    }
+
+    fn variant(&mut self, _v: &crate::spec::VariantType) -> crate::Result<ArrowSchemaOrFieldOrType> {
+        Ok(ArrowSchemaOrFieldOrType::Variant(VariantType))
     }
 }
 

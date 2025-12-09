@@ -90,6 +90,8 @@ pub enum Type {
     List(ListType),
     /// Map type
     Map(MapType),
+    /// Variant type
+    Variant(VariantType),
 }
 
 impl fmt::Display for Type {
@@ -99,6 +101,7 @@ impl fmt::Display for Type {
             Type::Struct(s) => write!(f, "{s}"),
             Type::List(_) => write!(f, "list"),
             Type::Map(_) => write!(f, "map"),
+            Type::Variant(_) => write!(f, "variant"),
         }
     }
 }
@@ -709,7 +712,7 @@ pub(super) mod _serde {
 
     use crate::spec::datatypes::Type::Map;
     use crate::spec::datatypes::{
-        ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, StructType, Type,
+        ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, StructType, Type, VariantType
     };
 
     /// List type for serialization and deserialization
@@ -735,6 +738,10 @@ pub(super) mod _serde {
             value_id: i32,
             value_required: bool,
             value: Cow<'a, Type>,
+        },
+        #[serde(rename_all = "kebab-case")]
+        Variant {
+            r#type: String,
         },
         Primitive(PrimitiveType),
     }
@@ -774,6 +781,9 @@ pub(super) mod _serde {
                 SerdeType::Struct { r#type: _, fields } => {
                     Self::Struct(StructType::new(fields.into_owned()))
                 }
+                SerdeType::Variant {
+                    r#type: _,
+                } => Self::Variant(VariantType::new()),
                 SerdeType::Primitive(p) => Self::Primitive(p),
             }
         }
@@ -800,6 +810,9 @@ pub(super) mod _serde {
                     r#type: "struct".to_string(),
                     fields: Cow::Borrowed(&s.fields),
                 },
+                Type::Variant(_) => SerdeType::Variant {
+                    r#type: "variant".to_string(),
+                },
                 Type::Primitive(p) => SerdeType::Primitive(p.clone()),
             }
         }
@@ -824,6 +837,22 @@ impl MapType {
         Self {
             key_field,
             value_field,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+/// A map is a collection of key-value pairs with a key type and a value type.
+/// Both the key field and value field each have an integer id that is unique in the table schema.
+/// Map keys are required and map values can be either optional or required.
+/// Both map keys and map values may be any type, including nested types.
+pub struct VariantType {
+}
+
+impl VariantType {
+    /// Construct a map type with the given key and value fields.
+    pub fn new() -> Self {
+        Self {
         }
     }
 }

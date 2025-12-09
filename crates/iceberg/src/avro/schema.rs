@@ -28,7 +28,7 @@ use serde_json::{Number, Value};
 
 use crate::spec::{
     ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, SchemaVisitor,
-    StructType, Type, visit_schema,
+    StructType, Type, visit_schema, VariantType,
 };
 use crate::{Error, ErrorKind, Result, ensure_data_valid};
 
@@ -242,6 +242,33 @@ impl SchemaVisitor for SchemaToAvroSchema {
             }
         };
         Ok(Either::Left(avro_schema))
+    }
+
+    fn variant(&mut self, _v: &VariantType) -> Result<AvroSchemaOrField> {
+        Ok(Either::Left(
+            avro_record_schema("variant", vec![
+                AvroRecordField {
+                    name: "metadata".to_string(),
+                    schema: AvroSchema::Bytes,
+                    order: RecordFieldOrder::Ignore,
+                    position: 0,
+                    custom_attributes: Default::default(),
+                    doc: None,
+                    aliases: None,
+                    default: None,
+                },
+                AvroRecordField {
+                    name: "value".to_string(),
+                    schema: AvroSchema::Bytes,
+                    order: RecordFieldOrder::Ignore,
+                    position: 1,
+                    custom_attributes: Default::default(),
+                    doc: None,
+                    aliases: None,
+                    default: None,
+                },
+            ])?
+        ))
     }
 }
 
