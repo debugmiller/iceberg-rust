@@ -641,7 +641,10 @@ impl SchemaVisitor for ToArrowSchemaConverter {
     }
 
     fn variant(&mut self, _v: &crate::spec::VariantType) -> crate::Result<ArrowSchemaOrFieldOrType> {
-        Ok(ArrowSchemaOrFieldOrType::Variant(VariantType))
+        Ok(ArrowSchemaOrFieldOrType::Type(DataType::Struct(Fields::from(vec![
+            Field::new("value", DataType::Binary, false),
+            Field::new("metadata", DataType::Binary, false),
+        ]).into()).into()))
     }
 }
 
