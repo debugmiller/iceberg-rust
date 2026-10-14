@@ -161,13 +161,10 @@ impl SchemaVisitor for GlueSchemaBuilder {
             PrimitiveType::Float => "float".to_string(),
             PrimitiveType::Double => "double".to_string(),
             PrimitiveType::Date => "date".to_string(),
-            PrimitiveType::Timestamp => "timestamp".to_string(),
-            PrimitiveType::TimestampNs => "timestamp_ns".to_string(),
-            PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    format!("Conversion from {p:?} is not supported"),
-                ));
+            // Glue has no zoned timestamp; the Java GlueCatalog writes both as `timestamp` too.
+            PrimitiveType::Timestamp | PrimitiveType::Timestamptz => "timestamp".to_string(),
+            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
+                "timestamp_ns".to_string()
             }
             PrimitiveType::Time | PrimitiveType::String | PrimitiveType::Uuid => {
                 "string".to_string()
@@ -341,6 +338,32 @@ mod tests {
             create_column("c11", "string", "11", false)?,
             create_column("c12", "binary", "12", false)?,
             create_column("c13", "binary", "13", false)?,
+        ];
+
+        assert_eq!(result, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_schema_with_zoned_timestamps() -> Result<()> {
+        let record = r#"{
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                { "id": 1, "name": "tz", "required": true, "type": "timestamptz" },
+                { "id": 2, "name": "tz_ns", "required": false, "type": "timestamptz_ns" }
+            ]
+        }"#;
+
+        let schema = serde_json::from_str::<Schema>(record)?;
+        let metadata = create_metadata_with_format_version(schema, FormatVersion::V3)?;
+
+        let result = GlueSchemaBuilder::from_iceberg(&metadata)?.build();
+
+        let expected = vec![
+            create_column("tz", "timestamp", "1", false)?,
+            create_column("tz_ns", "timestamp_ns", "2", true)?,
         ];
 
         assert_eq!(result, expected);
