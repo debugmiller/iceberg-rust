@@ -29,9 +29,13 @@ use crate::transaction::snapshot::{
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
+/// A check run against the table the append is about to be applied to.
+type Precondition = Arc<dyn Fn(&Table) -> Result<()> + Send + Sync>;
+
 /// FastAppendAction is a transaction action for fast append data files to the table.
 pub struct FastAppendAction {
     check_duplicate: bool,
+    precondition: Option<Precondition>,
     // below are properties used to create SnapshotProducer when commit
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
@@ -42,6 +46,7 @@ impl FastAppendAction {
     pub(crate) fn new() -> Self {
         Self {
             check_duplicate: true,
+            precondition: None,
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
@@ -51,6 +56,21 @@ impl FastAppendAction {
     /// Set whether to check duplicate files
     pub fn with_check_duplicate(mut self, v: bool) -> Self {
         self.check_duplicate = v;
+        self
+    }
+
+    /// Run `check` against the table every time the append is applied: first on the table the transaction
+    /// started from, then on the refreshed table each time a commit conflict makes it retry. An error from it
+    /// stops the commit and is returned as it is; mark it non-retryable (the default), or the commit retries.
+    ///
+    /// This is how a caller makes "has this already been committed?" atomic with the commit: the check sees
+    /// exactly the table the commit is based on, and a concurrent commit that changes it fails this commit's
+    /// compare-and-swap, which re-runs the check.
+    pub fn with_precondition(
+        mut self,
+        check: impl Fn(&Table) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.precondition = Some(Arc::new(check));
         self
     }
 
@@ -88,6 +108,9 @@ impl FastAppendAction {
 #[async_trait]
 impl TransactionAction for FastAppendAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        if let Some(check) = &self.precondition {
+            check(table)?;
+        }
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
@@ -478,6 +501,43 @@ mod tests {
             manifest.entries()[0].data_file().file_path(),
             "memory:///table/data/00000.parquet"
         );
+    }
+
+    /// The precondition sees the table the append is applied to and stops the commit when it fails.
+    #[tokio::test]
+    async fn test_precondition_stops_the_append() {
+        use crate::error::{Error, ErrorKind};
+
+        let table = make_v2_minimal_table();
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/precondition.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .build()
+            .unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = seen.clone();
+        let stopped = Transaction::new(&table)
+            .fast_append()
+            .add_data_files(vec![file.clone()])
+            .with_precondition(move |_| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(Error::new(ErrorKind::PreconditionFailed, "already there"))
+            });
+        let err = Arc::new(stopped).commit(&table).await.err().expect("the check failed");
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+        assert!(!err.retryable());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let passed = Transaction::new(&table)
+            .fast_append()
+            .add_data_files(vec![file])
+            .with_precondition(|_| Ok(()));
+        assert!(Arc::new(passed).commit(&table).await.is_ok());
     }
 
     #[tokio::test]
