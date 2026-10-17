@@ -296,10 +296,9 @@ impl SchemaVisitor for IndexByParquetPathName {
     }
 
     fn variant(&mut self, _v: &VariantType) -> Result<Self::T> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Writing variant columns to Parquet is not supported yet",
-        ))
+        // A variant is written as a Parquet group of `metadata` and `value` binaries. The group has one field id and
+        // its leaves none, so they get no column metrics (no bounds, sizes or counts).
+        Ok(())
     }
 }
 
@@ -931,9 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn test_index_by_parquet_path_variant_is_unsupported() {
-        // Writing variant columns to Parquet is not supported yet; indexing a schema that
-        // contains one must error rather than silently miss-map columns.
+    fn test_index_by_parquet_path_variant_has_no_leaves() {
         let schema = Schema::builder()
             .with_fields(vec![
                 NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
@@ -941,8 +938,8 @@ mod tests {
             .build()
             .unwrap();
         let mut visitor = IndexByParquetPathName::new();
-        let err = visit_schema(&schema, &mut visitor).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported, "{err}");
+        visit_schema(&schema, &mut visitor).unwrap();
+        assert!(visitor.name_to_id.is_empty());
     }
 
     #[tokio::test]

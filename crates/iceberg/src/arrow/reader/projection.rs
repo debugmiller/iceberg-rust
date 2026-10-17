@@ -124,16 +124,24 @@ impl ArrowReader {
             return Ok(ProjectionMask::all());
         }
 
-        // Reading variant columns is not supported yet (see #2188 follow-ups): reject any
-        // projection that touches a variant, rather than returning a partial/incorrect batch.
+        // A top-level variant is a Parquet group of two binary leaves that carry no field ids of their own, so it is
+        // projected by the id of the group. One nested in a struct, list or map is not supported yet: reject it,
+        // rather than return a partial/incorrect batch.
+        let mut variant_ids = HashSet::new();
         for field_id in field_ids {
-            if let Some(field) = iceberg_schema_of_task.field_by_id(*field_id)
-                && type_contains_variant(&field.field_type)
-            {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "Reading variant columns is not supported yet",
-                ));
+            if let Some(field) = iceberg_schema_of_task.field_by_id(*field_id) {
+                if matches!(field.field_type.as_ref(), Type::Variant(_)) {
+                    if iceberg_schema_of_task.as_struct().fields().iter().any(|f| f.id == *field_id) {
+                        variant_ids.insert(*field_id);
+                        continue;
+                    }
+                }
+                if type_contains_variant(&field.field_type) {
+                    return Err(Error::new(
+                        ErrorKind::FeatureUnsupported,
+                        "Reading variant columns nested in a struct, list or map is not supported yet",
+                    ));
+                }
             }
         }
 
@@ -152,13 +160,24 @@ impl ArrowReader {
                 }
             }
 
-            Self::get_arrow_projection_mask_with_field_ids(
+            let mask = Self::get_arrow_projection_mask_with_field_ids(
                 &leaf_field_ids,
                 iceberg_schema_of_task,
                 parquet_schema,
                 arrow_schema,
                 type_promotion_is_valid,
-            )
+            )?;
+            if variant_ids.is_empty() {
+                return Ok(mask);
+            }
+            // The leaves under each variant group, added to those the mask has.
+            let indices: Vec<usize> = (0..parquet_schema.num_columns())
+                .filter(|i| {
+                    let root = parquet_schema.get_column_root(*i).get_basic_info();
+                    mask.leaf_included(*i) || (root.has_id() && variant_ids.contains(&root.id()))
+                })
+                .collect();
+            Ok(ProjectionMask::leaves(parquet_schema, indices))
         }
     }
 
@@ -619,9 +638,9 @@ message schema {
     }
 
     #[test]
-    fn test_arrow_projection_mask_variant_is_unsupported() {
-        // Reading variant columns is not supported yet: projecting one (top-level or
-        // nested) must fail loudly rather than return a partial/incorrect batch.
+    fn test_arrow_projection_mask_nested_variant_is_unsupported() {
+        // Reading a variant nested in a struct, list or map is not supported yet: projecting one
+        // must fail loudly rather than return a partial/incorrect batch.
         let schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
@@ -658,9 +677,8 @@ message schema {
         ));
         let arrow_schema = Arc::new(ArrowSchema::empty());
 
-        // 2 = top-level variant, 3 = struct containing a variant, 4 = the nested variant,
-        // 5 = map<string, variant>, plus a mix with a non-variant sibling.
-        for projected in [vec![2], vec![3], vec![4], vec![5], vec![1, 2]] {
+        // 3 = struct containing a variant, 4 = the nested variant, 5 = map<string, variant>.
+        for projected in [vec![3], vec![4], vec![5]] {
             let err = ArrowReader::get_arrow_projection_mask(
                 &projected,
                 &schema,
