@@ -269,12 +269,14 @@ fn parse_bytes_entry(v: Vec<BytesEntry>, schema: &Schema) -> Result<HashMap<i32,
             .or_else(|| metadata_columns::get_metadata_field(entry.key).ok());
 
         if let Some(field) = field {
-            let data_type = field
-                .field_type
-                .as_primitive_type()
-                .ok_or_else(|| invalid_data!("field {} is not a primitive type", field.name))?
-                .clone();
-            m.insert(entry.key, Datum::try_from_bytes(&entry.value, data_type)?);
+            // A variant's bounds are a variant object of bounds by path (written by Java for shredded fields), which
+            // a `Datum` can't hold. They only prune files, so skip them, and any other non-primitive field's.
+            if let Some(data_type) = field.field_type.as_primitive_type() {
+                m.insert(
+                    entry.key,
+                    Datum::try_from_bytes(&entry.value, data_type.clone())?,
+                );
+            }
         }
         // We ignore the entry if the field is not found in schema or metadata columns (schema evolution).
     }
@@ -339,12 +341,37 @@ mod tests {
     use std::sync::Arc;
 
     use crate::avro::define_named_types_repeatedly;
-    use crate::spec::manifest::_serde::{I64Entry, parse_i64_entry};
+    use crate::spec::manifest::_serde::{BytesEntry, I64Entry, parse_bytes_entry, parse_i64_entry};
     use crate::spec::{
         DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, Literal, NestedField,
-        PrimitiveType, Schema, Struct, StructType, Type, read_data_files_from_avro,
+        PrimitiveType, Schema, Struct, StructType, Type, VariantType, read_data_files_from_avro,
         write_data_files_to_avro,
     };
+
+    #[test]
+    fn test_parse_bytes_entry_skips_non_primitive_field() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "n", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+            ])
+            .build()
+            .unwrap();
+        let entries = vec![
+            BytesEntry {
+                key: 1,
+                value: 7i64.to_le_bytes().to_vec().into(),
+            },
+            BytesEntry {
+                key: 2,
+                value: b"text bound from when v was a string".to_vec().into(),
+            },
+        ];
+
+        let ret = parse_bytes_entry(entries, &schema).unwrap();
+
+        assert_eq!(ret, HashMap::from([(1, Datum::long(7))]));
+    }
 
     #[test]
     fn test_parse_negative_manifest_entry() {

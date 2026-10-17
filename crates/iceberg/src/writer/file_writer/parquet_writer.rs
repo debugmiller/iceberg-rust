@@ -750,7 +750,7 @@ mod tests {
     use arrow_array::builder::{Float32Builder, Int32Builder, MapBuilder};
     use arrow_array::types::{Float32Type, Int64Type};
     use arrow_array::{
-        Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array,
+        Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array,
         Int64Array, ListArray, MapArray, RecordBatch, StructArray,
     };
     use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
@@ -1013,6 +1013,72 @@ mod tests {
         let expect_batch = concat_batches(&schema, vec![&to_write, &to_write_null]).unwrap();
         check_parquet_data_file(&file_io, &data_file, &expect_batch).await;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_variant_has_no_bounds() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "n", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()?,
+        );
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&schema)?);
+        let DataType::Struct(variant_fields) = arrow_schema.field(1).data_type().clone() else {
+            panic!("variant is not a struct");
+        };
+        let variant = StructArray::new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from_iter_values([b"m1", b"m2"])) as ArrayRef,
+                Arc::new(BinaryArray::from_iter_values([b"a", b"b"])) as ArrayRef,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int64Array::from_iter_values(0..2)) as ArrayRef,
+            Arc::new(variant) as ArrayRef,
+        ])?;
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+            .build(output_file)
+            .await?;
+        pw.write(&batch).await?;
+        let data_file = pw
+            .close()
+            .await?
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            *data_file.lower_bounds(),
+            HashMap::from([(1, Datum::long(0))])
+        );
+        assert_eq!(
+            *data_file.upper_bounds(),
+            HashMap::from([(1, Datum::long(1))])
+        );
+        assert_eq!(*data_file.value_counts(), HashMap::from([(1, 2)]));
         Ok(())
     }
 
