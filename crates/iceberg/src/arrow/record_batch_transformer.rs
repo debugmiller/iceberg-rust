@@ -31,6 +31,7 @@ use arrow_schema::{
 };
 use arrow_select::zip::zip;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet_variant_compute::{VariantArray, unshred_variant};
 
 use crate::arrow::schema::try_get_field_id_from_metadata;
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
@@ -204,6 +205,12 @@ pub(crate) enum ColumnSource {
 pub(crate) enum PromotePlan {
     PassThrough,
     Cast(DataType),
+    /// A shredded variant (`typed_value` beside `metadata` and `value`, as Java and S3 Tables compaction write it)
+    /// rebuilt as the table's `metadata` and `value`. Shredding differs file to file, so the typed columns can't
+    /// reach the table's one column type.
+    UnshredVariant {
+        fields: Fields,
+    },
     Struct {
         fields: Fields,
         children: Vec<ChildPlan>,
@@ -243,6 +250,13 @@ impl PromotePlan {
             return Ok(PromotePlan::PassThrough);
         }
         match (source, target) {
+            (DataType::Struct(source_fields), DataType::Struct(target_fields))
+                if is_shredded_variant(source_fields, target_fields) =>
+            {
+                Ok(PromotePlan::UnshredVariant {
+                    fields: target_fields.clone(),
+                })
+            }
             (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
                 Ok(PromotePlan::Struct {
                     children: Self::build_struct_children(
@@ -398,6 +412,24 @@ impl PromotePlan {
         match self {
             PromotePlan::PassThrough => Ok(Arc::clone(array)),
             PromotePlan::Cast(target_type) => Ok(cast(array.as_ref(), target_type)?),
+            PromotePlan::UnshredVariant { fields } => {
+                let unshredded = unshred_variant(&VariantArray::try_new(array.as_ref())?)?;
+                let inner = unshredded.inner();
+                let columns = fields
+                    .iter()
+                    .map(|field| {
+                        let column = inner.column_by_name(field.name()).ok_or_else(|| {
+                            invalid_data!("unshredded variant has no {} column", field.name())
+                        })?;
+                        Ok(cast(column.as_ref(), field.data_type())?)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Arc::new(StructArray::try_new(
+                    fields.clone(),
+                    columns,
+                    array.nulls().cloned(),
+                )?))
+            }
             PromotePlan::Struct { fields, children } => {
                 let source = array
                     .as_struct_opt()
@@ -462,6 +494,18 @@ impl PromotePlan {
             source.nulls().cloned(),
         )?)
     }
+}
+
+/// Whether a file's `source` struct is a shredded variant and `target` the table's variant: `metadata` and `value`
+/// binaries, with no field ids on either side. The file has a `typed_value` as well.
+fn is_shredded_variant(source: &Fields, target: &Fields) -> bool {
+    let has = |fields: &Fields, name: &str| fields.iter().any(|f| f.name() == name);
+    target.len() == 2
+        && target[0].name() == "metadata"
+        && target[1].name() == "value"
+        && has(source, "metadata")
+        && has(source, "value")
+        && has(source, "typed_value")
 }
 
 fn promote_err(array: &ArrayRef, expected: &str) -> Error {
@@ -1449,6 +1493,54 @@ mod test {
 
     fn empty_schema() -> Schema {
         Schema::builder().build().unwrap()
+    }
+
+    #[test]
+    fn test_shredded_variant_is_unshredded_to_the_table_type() {
+        use parquet_variant_compute::{VariantArray, json_to_variant, shred_variant};
+
+        let json: ArrayRef = Arc::new(StringArray::from(vec![
+            Some(r#"{"policyArn":"arn:a","n":1}"#),
+            None,
+            Some(r#"{"other":true}"#),
+            Some(r#"{"policyArn":"arn:b"}"#),
+        ]));
+        let plain = json_to_variant(&json).unwrap();
+        let shredded = shred_variant(
+            &plain,
+            &DataType::Struct(Fields::from(vec![Field::new(
+                "policyArn",
+                DataType::Utf8,
+                true,
+            )])),
+        )
+        .unwrap();
+        let source: ArrayRef = Arc::new(shredded.into_inner());
+        assert!(matches!(source.data_type(), DataType::Struct(f) if f.len() == 3));
+
+        // The table's type for a variant: `metadata` and `value` binaries.
+        let target = DataType::Struct(Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, true),
+        ]));
+        let plan = PromotePlan::build(
+            source.data_type(),
+            &target,
+            &empty_schema(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(matches!(plan, PromotePlan::UnshredVariant { .. }));
+        let out = plan.apply(&source).unwrap();
+        assert_eq!(out.data_type(), &target);
+        assert_eq!(out.null_count(), 1);
+
+        // Every row reads back as the value it was.
+        let got = VariantArray::try_new(out.as_ref()).unwrap();
+        for i in [0usize, 2, 3] {
+            assert_eq!(got.value(i), plain.value(i), "row {i}");
+        }
+        assert!(got.is_null(1));
     }
 
     fn unevolved_struct_type() -> DataType {
