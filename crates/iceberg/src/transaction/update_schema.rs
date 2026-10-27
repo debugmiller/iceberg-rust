@@ -115,6 +115,7 @@ impl AddColumn {
 pub struct UpdateSchemaAction {
     additions: Vec<AddColumn>,
     deletes: Vec<String>,
+    optionals: Vec<String>,
 }
 
 impl UpdateSchemaAction {
@@ -123,6 +124,7 @@ impl UpdateSchemaAction {
         Self {
             additions: Vec::new(),
             deletes: Vec::new(),
+            optionals: Vec::new(),
         }
     }
 
@@ -145,6 +147,15 @@ impl UpdateSchemaAction {
     /// At commit time, the column must exist in the current schema.
     pub fn delete_column(mut self, name: impl ToString) -> Self {
         self.deletes.push(name.to_string());
+        self
+    }
+
+    /// Record that a required column becomes optional, by name (`a.b` for a field of struct `a`).
+    ///
+    /// Always a compatible change: old files that wrote the column keep reading, and new ones may write nulls.
+    /// At commit time, the column must exist in the current schema; one that is optional already is left as it is.
+    pub fn make_optional(mut self, name: impl ToString) -> Self {
+        self.optionals.push(name.to_string());
         self
     }
 }
@@ -327,6 +338,34 @@ fn rebuild_field(
     }
 }
 
+/// Rebuild a slice of fields with every field whose ID is in `ids` marked optional, at any depth.
+fn relax_fields(fields: &[NestedFieldRef], ids: &HashSet<i32>) -> Vec<NestedFieldRef> {
+    fields.iter().map(|f| relax_field(f, ids)).collect()
+}
+
+fn relax_field(field: &NestedFieldRef, ids: &HashSet<i32>) -> NestedFieldRef {
+    let field_type = match field.field_type.as_ref() {
+        Type::Struct(s) => Type::Struct(StructType::new(relax_fields(s.fields(), ids))),
+        Type::List(l) => Type::List(ListType {
+            element_field: relax_field(&l.element_field, ids),
+        }),
+        Type::Map(m) => Type::Map(MapType {
+            key_field: relax_field(&m.key_field, ids),
+            value_field: relax_field(&m.value_field, ids),
+        }),
+        other => other.clone(),
+    };
+    Arc::new(NestedField {
+        id: field.id,
+        name: field.name.clone(),
+        required: field.required && !ids.contains(&field.id),
+        field_type: Box::new(field_type),
+        doc: field.doc.clone(),
+        initial_default: field.initial_default.clone(),
+        write_default: field.write_default.clone(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // TransactionAction implementation
 // ---------------------------------------------------------------------------
@@ -451,7 +490,23 @@ impl TransactionAction for UpdateSchemaAction {
             None,
         );
 
-        // --- 5. Build the new schema ---
+        // --- 5. Make the columns named optional, then build the new schema ---
+        let optional_ids = self
+            .optionals
+            .iter()
+            .map(|name| {
+                base_schema
+                    .field_by_name(name)
+                    .map(|field| field.id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::PreconditionFailed,
+                            format!("Cannot make missing column optional: {name}"),
+                        )
+                    })
+            })
+            .collect::<Result<HashSet<i32>>>()?;
+        let new_fields = relax_fields(&new_fields, &optional_ids);
         let schema = Schema::builder()
             .with_fields(new_fields)
             .with_identifier_field_ids(base_schema.identifier_field_ids())
@@ -732,6 +787,41 @@ mod tests {
             "error should mention name conflict, got: {}",
             err.message()
         );
+    }
+
+    #[tokio::test]
+    async fn test_make_optional() {
+        let table = make_v2_table_with_nested();
+        let tx = Transaction::new(&table);
+
+        // z is top level and required; person.age is required inside an optional struct.
+        let action = tx.update_schema().make_optional("z").make_optional("person.age");
+
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let new_schema = match &updates[0] {
+            TableUpdate::AddSchema { schema } => schema,
+            other => panic!("expected AddSchema, got {other:?}"),
+        };
+
+        assert!(!new_schema.field_by_name("z").unwrap().required);
+        assert!(!new_schema.field_by_name("person.age").unwrap().required);
+        // Ids and the rest stay as they were.
+        assert_eq!(new_schema.field_by_name("person.age").unwrap().id, 6);
+        assert!(new_schema.field_by_name("x").unwrap().required);
+    }
+
+    #[tokio::test]
+    async fn test_make_missing_column_optional_fails() {
+        let table = make_v2_table();
+        let tx = Transaction::new(&table);
+        let action = tx.update_schema().make_optional("nope");
+
+        let err = match Arc::new(action).commit(&table).await {
+            Err(e) => e,
+            Ok(_) => panic!("should reject a missing column"),
+        };
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
     }
 
     #[tokio::test]
