@@ -327,21 +327,6 @@ impl ManifestWriter {
         Ok(())
     }
 
-    /// Add an entry that was deleted by an earlier snapshot, as it was: its status, snapshot id and sequence
-    /// numbers are kept. [`Self::add_delete_entry`] records a deletion made now and sets the snapshot id to this
-    /// manifest's, which would rewrite when a rewritten manifest says the file was deleted.
-    pub(crate) fn add_deleted_entry_as_is(&mut self, entry: ManifestEntry) -> Result<()> {
-        if entry.status != ManifestStatus::Deleted {
-            return Err(invalid_data!(
-                "add_deleted_entry_as_is takes a Deleted entry, got {:?}",
-                entry.status
-            ));
-        }
-        self.check_data_file(&entry.data_file)?;
-        self.add_entry_inner(entry)?;
-        Ok(())
-    }
-
     /// Add a file as delete manifest entry. The entry's snapshot ID will be this manifest's snapshot ID.
     /// However, the original data and file sequence numbers of the file must be preserved when
     /// the file is marked as deleted.

@@ -1234,9 +1234,9 @@ mod merge_tests {
     }
 
     /// What S3 Tables' compaction leaves: for each file it rewrites, one manifest adding the new file and one that
-    /// only records the old file as deleted. They merge too, and the deleted entries stay as they were.
+    /// only records the old file as deleted. They merge too, and as in Java the deletions of earlier snapshots are left out.
     #[tokio::test]
-    async fn manifest_merge_consolidates_delete_only_manifests_and_keeps_their_entries() {
+    async fn manifest_merge_consolidates_delete_only_manifests_and_drops_old_deletions() {
         use uuid::Uuid;
 
         use crate::spec::{ManifestWriterBuilder, Struct};
@@ -1318,7 +1318,7 @@ mod merge_tests {
             .unwrap();
         assert_eq!(merged.len(), 1, "eight manifests became one");
         assert_eq!(merged[0].existing_files_count, Some(4));
-        assert_eq!(merged[0].deleted_files_count, Some(4));
+        assert_eq!(merged[0].deleted_files_count, Some(0));
 
         let manifest = table.object_cache().get_manifest(&merged[0]).await.unwrap();
         let mut seen = BTreeMap::new();
@@ -1335,7 +1335,11 @@ mod merge_tests {
                 (entry.status(), entry.snapshot_id(), entry.sequence_number()),
             );
         }
-        assert_eq!(seen.len(), 8);
+        assert_eq!(
+            seen.len(),
+            4,
+            "the four deletions of the earlier snapshot are gone"
+        );
         for i in 0..4i64 {
             assert_eq!(
                 seen[&format!("new{i}.parquet")],
@@ -1346,15 +1350,63 @@ mod merge_tests {
                 ),
                 "a live file keeps the snapshot and sequence number it had"
             );
-            assert_eq!(
-                seen[&format!("old{i}.parquet")],
-                (
-                    ManifestStatus::Deleted,
-                    Some(compaction_snapshot),
-                    Some(3 + i)
-                ),
-                "a deleted file stays deleted, as the earlier snapshot recorded"
-            );
+            assert!(!seen.contains_key(&format!("old{i}.parquet")));
         }
+    }
+
+    /// A pack of manifests that only record deletions of earlier snapshots leaves nothing to write.
+    #[tokio::test]
+    async fn manifest_merge_of_only_old_deletions_leaves_no_manifest() {
+        use uuid::Uuid;
+
+        use crate::spec::{ManifestWriterBuilder, Struct};
+        use crate::transaction::snapshot::{
+            ManifestProcess, MergeManifestProcess, SnapshotProducer,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let (_catalog, table) = new_table(FormatVersion::V2, &dir).await;
+        let schema = table.metadata().current_schema().clone();
+        let spec = table.metadata().default_partition_spec().as_ref().clone();
+        let mut manifests = Vec::new();
+        for i in 0..6i64 {
+            let file = DataFileBuilder::default()
+                .partition_spec_id(0)
+                .content(DataContentType::Data)
+                .file_path(format!(
+                    "{}/data/old{i}.parquet",
+                    table.metadata().location()
+                ))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(10)
+                .partition(Struct::empty())
+                .build()
+                .unwrap();
+            let output = table
+                .file_io()
+                .new_output(format!(
+                    "{}/metadata/only-del-{i}.avro",
+                    table.metadata().location()
+                ))
+                .unwrap();
+            let mut writer =
+                ManifestWriterBuilder::new(output, Some(99), schema.clone(), spec.clone())
+                    .build_v2_data();
+            writer.add_delete_file(file, 3 + i, Some(3 + i)).unwrap();
+            let mut manifest = writer.write_manifest_file().await.unwrap();
+            manifest.sequence_number = 60;
+            manifest.min_sequence_number = 3;
+            manifests.push(manifest);
+        }
+        let mut producer = SnapshotProducer::new(&table, Uuid::new_v4(), HashMap::new(), vec![]);
+        let merged = MergeManifestProcess {
+            min_count: 5,
+            target_size_bytes: 8 * 1024 * 1024,
+        }
+        .process_manifests(&mut producer, manifests)
+        .await
+        .unwrap();
+        assert!(merged.is_empty(), "{} manifests left", merged.len());
     }
 }

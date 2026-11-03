@@ -115,12 +115,14 @@ pub(crate) const MANIFEST_MERGE_TARGET_SIZE_BYTES: u64 = 8 * 1024 * 1024;
 /// fast appends (one manifest per commit) does not grow a manifest list that every reader must open.
 ///
 /// Only manifests that belong to the default partition spec, are not encrypted, and are under half of
-/// [`MANIFEST_MERGE_TARGET_SIZE_BYTES`] are candidates, deleted entries included (S3 Tables' compaction writes a
-/// one-entry manifest for each file it removes, and they are most of a compacted table's manifests); the manifest this commit adds is never one, as its entries take their sequence number
+/// [`MANIFEST_MERGE_TARGET_SIZE_BYTES`] are candidates, ones with deleted entries included (S3 Tables' compaction
+/// writes a one-entry manifest for each file it removes, and they are most of a compacted table's manifests); the manifest this commit adds is never one, as its entries take their sequence number
 /// when the commit is made. Once `min_count` candidates have built up they are packed, oldest first,
 /// into manifests of at most the target size, and each pack of two or more is rewritten as one
-/// manifest whose entries are `Existing` (or still `Deleted`), with the snapshot id, sequence numbers and
-/// first row id they had. A pack's manifest takes the place of its first member in the list.
+/// manifest whose entries are `Existing`, with the snapshot id, sequence numbers and first row id they had.
+/// As Java's `ManifestMergeManager` does, entries deleted by an earlier snapshot are left out (they only
+/// matter to a reader of that snapshot, and the files they name are in no live entry), so a pack of manifests
+/// that only record deletions leaves no manifest at all. A pack's manifest takes the place of its first member in the list.
 pub(crate) struct MergeManifestProcess {
     pub(crate) min_count: usize,
     pub(crate) target_size_bytes: u64,
@@ -181,19 +183,31 @@ impl ManifestProcess for MergeManifestProcess {
         for bin in bins.into_iter().filter(|bin| bin.len() > 1) {
             let mut writer = snapshot_produce.new_manifest_writer(ManifestContentType::Data)?;
             let mut mergeable = true;
+            let mut kept = 0usize;
             for &i in &bin {
                 let manifest = cache.get_manifest(&manifests[i]).await?;
                 for entry in manifest.entries() {
-                    // An entry without its sequence numbers can't be written as an existing one.
-                    if entry.sequence_number().is_none() || entry.file_sequence_number.is_none() {
-                        mergeable = false;
-                        break;
-                    }
                     let entry = entry.as_ref().clone();
                     match entry.status {
-                        ManifestStatus::Deleted => writer.add_deleted_entry_as_is(entry)?,
-                        _ => writer.add_existing_entry(entry)?,
+                        // Deleted before this snapshot: only a reader of that snapshot has a use for it.
+                        ManifestStatus::Deleted if entry.snapshot_id != Some(snapshot_id) => {
+                            continue;
+                        }
+                        ManifestStatus::Deleted => {
+                            writer.add_delete_entry(entry)?;
+                        }
+                        _ => {
+                            // An entry without its sequence numbers can't be written as an existing one.
+                            if entry.sequence_number().is_none()
+                                || entry.file_sequence_number.is_none()
+                            {
+                                mergeable = false;
+                                break;
+                            }
+                            writer.add_existing_entry(entry)?;
+                        }
                     }
+                    kept += 1;
                 }
                 if !mergeable {
                     break;
@@ -206,9 +220,14 @@ impl ManifestProcess for MergeManifestProcess {
                 );
                 continue;
             }
-            let merged = writer.write_manifest_file().await?;
+            // Nothing left but deletions of earlier snapshots: the pack goes without a manifest to take its place.
+            let merged = if kept == 0 {
+                None
+            } else {
+                Some(writer.write_manifest_file().await?)
+            };
             for (n, &i) in bin.iter().enumerate() {
-                merged_into.insert(i, if n == 0 { Some(merged.clone()) } else { None });
+                merged_into.insert(i, if n == 0 { merged.clone() } else { None });
             }
         }
 
