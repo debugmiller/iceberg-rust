@@ -104,6 +104,35 @@ impl ObjectCache {
         }
     }
 
+    /// Copies from `previous` the parsed manifests that the manifest list of `snapshot` lists, so a table
+    /// loaded again after a commit does not read and parse the manifests it shares with the one before.
+    /// Manifests are immutable, so an entry is the same whichever table version it was parsed for. Only the
+    /// manifests this snapshot lists are copied, so what the cache holds stays the size of one snapshot's.
+    /// Returns how many were copied.
+    pub(crate) async fn carry_over_manifests(
+        &self,
+        previous: &ObjectCache,
+        snapshot: &SnapshotRef,
+        table_metadata: &TableMetadataRef,
+    ) -> Result<usize> {
+        if self.cache_disabled || previous.cache_disabled {
+            return Ok(0);
+        }
+        let list = self.get_manifest_list(snapshot, table_metadata).await?;
+        let mut carried = 0;
+        for manifest_file in list.entries() {
+            let key = CachedObjectKey::Manifest((
+                manifest_file.manifest_path.clone(),
+                manifest_file.first_row_id,
+            ));
+            if let Some(item) = previous.cache.get(&key).await {
+                self.cache.insert(key, item).await;
+                carried += 1;
+            }
+        }
+        Ok(carried)
+    }
+
     /// Retrieves an Arc [`Manifest`] from the cache
     /// or retrieves one from FileIO and parses it if not present
     pub(crate) async fn get_manifest(&self, manifest_file: &ManifestFile) -> Result<Arc<Manifest>> {

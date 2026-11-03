@@ -90,21 +90,124 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
 pub(crate) struct DefaultManifestProcess;
 
 impl ManifestProcess for DefaultManifestProcess {
-    fn process_manifests(
+    async fn process_manifests(
         &self,
-        _snapshot_produce: &SnapshotProducer<'_>,
+        _snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile> {
-        manifests
+    ) -> Result<Vec<ManifestFile>> {
+        Ok(manifests)
     }
 }
 
 pub(crate) trait ManifestProcess: Send + Sync {
     fn process_manifests(
         &self,
-        snapshot_produce: &SnapshotProducer<'_>,
+        snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile>;
+    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
+}
+
+/// The size a merged manifest may reach, and the one a manifest must be under half of to be merged
+/// (Java's `commit.manifest.target-size-bytes`, 8 MiB).
+pub(crate) const MANIFEST_MERGE_TARGET_SIZE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Merges the small data manifests a snapshot carries forward, so a table committed to many times by
+/// fast appends (one manifest per commit) does not grow a manifest list that every reader must open.
+///
+/// Only manifests that hold nothing but live entries (no deleted ones), belong to the default
+/// partition spec, are not encrypted, and are under half of [`MANIFEST_MERGE_TARGET_SIZE_BYTES`] are
+/// candidates; the manifest this commit adds is never one, as its entries take their sequence number
+/// when the commit is made. Once `min_count` candidates have built up they are packed, oldest first,
+/// into manifests of at most the target size, and each pack of two or more is rewritten as one
+/// manifest whose entries are `Existing`, with the snapshot id, sequence numbers and first row id
+/// they had. A pack's manifest takes the place of its first member in the list.
+pub(crate) struct MergeManifestProcess {
+    pub(crate) min_count: usize,
+    pub(crate) target_size_bytes: u64,
+}
+
+impl ManifestProcess for MergeManifestProcess {
+    async fn process_manifests(
+        &self,
+        snapshot_produce: &mut SnapshotProducer<'_>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        let spec_id = snapshot_produce
+            .table
+            .metadata()
+            .default_partition_spec_id();
+        let snapshot_id = snapshot_produce.snapshot_id;
+        let candidate = |m: &ManifestFile| {
+            m.content == ManifestContentType::Data
+                && m.partition_spec_id == spec_id
+                && m.added_snapshot_id != snapshot_id
+                && !m.has_deleted_files()
+                && m.key_metadata.is_none()
+                && m.manifest_length >= 0
+                && (m.manifest_length as u64) < self.target_size_bytes / 2
+        };
+        if manifests.iter().filter(|m| candidate(m)).count() < self.min_count.max(2) {
+            return Ok(manifests);
+        }
+
+        // Pack the candidates, oldest first, into bins of at most the target size.
+        let mut bins: Vec<Vec<usize>> = Vec::new();
+        let mut bin_bytes = 0u64;
+        for (i, m) in manifests.iter().enumerate() {
+            if !candidate(m) {
+                continue;
+            }
+            let len = m.manifest_length as u64;
+            match bins.last_mut() {
+                Some(bin) if bin_bytes + len <= self.target_size_bytes => {
+                    bin.push(i);
+                    bin_bytes += len;
+                }
+                _ => {
+                    bins.push(vec![i]);
+                    bin_bytes = len;
+                }
+            }
+        }
+
+        let cache = snapshot_produce.table.object_cache();
+        // For each manifest that is merged away, its index; for the first of a pack, the merged manifest.
+        let mut merged_into: HashMap<usize, Option<ManifestFile>> = HashMap::new();
+        for bin in bins.into_iter().filter(|bin| bin.len() > 1) {
+            let mut writer = snapshot_produce.new_manifest_writer(ManifestContentType::Data)?;
+            let mut mergeable = true;
+            for &i in &bin {
+                let manifest = cache.get_manifest(&manifests[i]).await?;
+                for entry in manifest.entries() {
+                    // An entry without its sequence numbers can't be written as an existing one.
+                    if entry.sequence_number().is_none() || entry.file_sequence_number.is_none() {
+                        mergeable = false;
+                        break;
+                    }
+                    writer.add_existing_entry(entry.as_ref().clone())?;
+                }
+                if !mergeable {
+                    break;
+                }
+            }
+            if !mergeable {
+                continue;
+            }
+            let merged = writer.write_manifest_file().await?;
+            for (n, &i) in bin.iter().enumerate() {
+                merged_into.insert(i, if n == 0 { Some(merged.clone()) } else { None });
+            }
+        }
+
+        Ok(manifests
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, m)| match merged_into.remove(&i) {
+                None => Some(m),
+                Some(replacement) => replacement,
+            })
+            .collect())
+    }
 }
 
 pub(crate) struct SnapshotProducer<'a> {
@@ -361,7 +464,9 @@ impl<'a> SnapshotProducer<'a> {
         // # TODO
         // Support process delete entries.
 
-        let manifest_files = manifest_process.process_manifests(self, manifest_files);
+        let manifest_files = manifest_process
+            .process_manifests(self, manifest_files)
+            .await?;
         Ok(manifest_files)
     }
 

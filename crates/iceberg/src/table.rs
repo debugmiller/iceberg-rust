@@ -256,6 +256,25 @@ impl Table {
         &self.file_io
     }
 
+    /// Returns this table with the parsed manifests of `previous`'s cache that its current snapshot
+    /// lists, and how many that was.
+    ///
+    /// A table loaded after a commit starts with an empty cache, so a reader of a table that is committed
+    /// to often parses every manifest again for each version, though manifests never change. Call this
+    /// on the new version with the one read before it. It reads the snapshot's manifest list (which a
+    /// scan reads next, from the cache), and copies only the manifests that list names, so the cache
+    /// does not grow with the manifests of snapshots that are gone.
+    pub async fn with_manifests_of(self, previous: &Table) -> Result<(Self, usize)> {
+        let Some(snapshot) = self.metadata.current_snapshot() else {
+            return Ok((self, 0));
+        };
+        let carried = self
+            .object_cache
+            .carry_over_manifests(&previous.object_cache, snapshot, &self.metadata)
+            .await?;
+        Ok((self, carried))
+    }
+
     /// Returns this table's object cache
     pub(crate) fn object_cache(&self) -> Arc<ObjectCache> {
         self.object_cache.clone()

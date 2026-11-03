@@ -25,7 +25,8 @@ use crate::error::Result;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, MANIFEST_MERGE_TARGET_SIZE_BYTES, MergeManifestProcess,
+    SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
@@ -40,6 +41,7 @@ pub struct FastAppendAction {
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    merge_manifests_from: Option<usize>,
 }
 
 impl FastAppendAction {
@@ -50,7 +52,16 @@ impl FastAppendAction {
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
+            merge_manifests_from: None,
         }
+    }
+
+    /// Rewrite the small data manifests the snapshot carries forward as fewer, larger ones once
+    /// `min_count` of them have built up (see `MergeManifestProcess`), instead of leaving one manifest
+    /// per commit. The manifest this commit adds is not merged until a later commit.
+    pub fn with_manifest_merge(mut self, min_count: usize) -> Self {
+        self.merge_manifests_from = Some(min_count);
+        self
     }
 
     /// Set whether to check duplicate files
@@ -126,9 +137,21 @@ impl TransactionAction for FastAppendAction {
             snapshot_producer.validate_duplicate_files().await?;
         }
 
-        snapshot_producer
-            .commit(FastAppendOperation, DefaultManifestProcess)
-            .await
+        match self.merge_manifests_from {
+            Some(min_count) => {
+                snapshot_producer
+                    .commit(FastAppendOperation, MergeManifestProcess {
+                        min_count,
+                        target_size_bytes: MANIFEST_MERGE_TARGET_SIZE_BYTES,
+                    })
+                    .await
+            }
+            None => {
+                snapshot_producer
+                    .commit(FastAppendOperation, DefaultManifestProcess)
+                    .await
+            }
+        }
     }
 }
 
@@ -528,7 +551,11 @@ mod tests {
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(Error::new(ErrorKind::PreconditionFailed, "already there"))
             });
-        let err = Arc::new(stopped).commit(&table).await.err().expect("the check failed");
+        let err = Arc::new(stopped)
+            .commit(&table)
+            .await
+            .err()
+            .expect("the check failed");
         assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
         assert!(!err.retryable());
         assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1010,5 +1037,199 @@ mod tests {
             manifest.entries()[0].snapshot_id().unwrap()
         );
         assert_eq!(data_file, *manifest.entries()[0].data_file());
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use crate::io::LocalFsStorageFactory;
+    use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    use crate::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, ManifestStatus,
+        NestedField, PrimitiveType, Schema, Struct, Type,
+    };
+    use crate::table::Table;
+    use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+
+    async fn new_table(format: FormatVersion, dir: &TempDir) -> (impl Catalog, Table) {
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let catalog = MemoryCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+            )
+            .await
+            .unwrap();
+        let namespace = NamespaceIdent::new("ns".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("merge".to_string())
+                    .schema(schema)
+                    .format_version(format)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        (catalog, table)
+    }
+
+    /// Appends one file of `n + 1` rows, merging manifests from `merge` if given.
+    async fn append(
+        catalog: &impl Catalog,
+        table: &Table,
+        n: usize,
+        merge: Option<usize>,
+    ) -> Table {
+        let file = DataFileBuilder::default()
+            .partition_spec_id(0)
+            .content(DataContentType::Data)
+            .file_path(format!("{}/data/f{n}.parquet", table.metadata().location()))
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(n as u64 + 1)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+        let tx = Transaction::new(table);
+        let mut action = tx.fast_append().add_data_files([file]);
+        if let Some(min) = merge {
+            action = action.with_manifest_merge(min);
+        }
+        action.apply(tx).unwrap().commit(catalog).await.unwrap()
+    }
+
+    /// Every live file of the table's current snapshot: path to (rows, first row id, snapshot id, sequence number).
+    async fn live_files(
+        table: &Table,
+    ) -> (
+        BTreeMap<String, (u64, Option<i64>, Option<i64>, Option<i64>)>,
+        usize,
+    ) {
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let list = table
+            .object_cache()
+            .get_manifest_list(snapshot, &table.metadata_ref())
+            .await
+            .unwrap();
+        let mut files = BTreeMap::new();
+        for manifest_file in list.entries() {
+            let manifest = table
+                .object_cache()
+                .get_manifest(manifest_file)
+                .await
+                .unwrap();
+            for entry in manifest.entries() {
+                if entry.status() == ManifestStatus::Deleted {
+                    continue;
+                }
+                let file = entry.data_file();
+                let seen = files.insert(
+                    file.file_path().to_string(),
+                    (
+                        file.record_count(),
+                        file.first_row_id(),
+                        entry.snapshot_id(),
+                        entry.sequence_number(),
+                    ),
+                );
+                assert!(seen.is_none(), "{} is in two manifests", file.file_path());
+            }
+        }
+        (files, list.entries().len())
+    }
+
+    async fn merges_without_changing_the_files(format: FormatVersion) {
+        let dir = TempDir::new().unwrap();
+        let (catalog, mut table) = new_table(format, &dir).await;
+        // What each file had when its own commit made it: rows, first row id, snapshot, sequence number.
+        let mut at_commit = BTreeMap::new();
+        let mut most_manifests = 0;
+        for n in 0..23 {
+            table = append(&catalog, &table, n, Some(5)).await;
+            let (files, manifests) = live_files(&table).await;
+            most_manifests = most_manifests.max(manifests);
+            let name = format!("f{n}.parquet");
+            let (path, v) = files
+                .iter()
+                .find(|(path, _)| path.ends_with(&name))
+                .unwrap_or_else(|| panic!("{name} is not in the table after its commit"));
+            at_commit.insert(path.clone(), *v);
+        }
+        let (files, manifests) = live_files(&table).await;
+        // Without merging there would be 23; with 5 to merge there are never many more than that.
+        assert!(manifests < 12, "{manifests} manifests after 23 commits");
+        assert!(most_manifests < 12, "{most_manifests} manifests at most");
+        assert_eq!(files.len(), 23);
+        for (path, now) in &files {
+            let then = at_commit[path];
+            assert_eq!(then.0, now.0, "{path}: rows");
+            assert_eq!(then.1, now.1, "{path}: first row id");
+            assert_eq!(then.3, now.3, "{path}: sequence number");
+            // The snapshot that added a file stays the one that did, though its manifest was rewritten.
+            assert_eq!(then.2, now.2, "{path}: snapshot id");
+        }
+        // No row id is given twice.
+        let mut ranges: Vec<(i64, i64)> = files
+            .values()
+            .filter_map(|(rows, first, ..)| first.map(|f| (f, f + *rows as i64)))
+            .collect();
+        ranges.sort();
+        for pair in ranges.windows(2) {
+            assert!(pair[0].1 <= pair[1].0, "row ids overlap: {pair:?}");
+        }
+        if format == FormatVersion::V3 {
+            assert_eq!(ranges.len(), 23);
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_merge_keeps_every_file_v2() {
+        merges_without_changing_the_files(FormatVersion::V2).await;
+    }
+
+    #[tokio::test]
+    async fn manifest_merge_keeps_every_file_v3() {
+        merges_without_changing_the_files(FormatVersion::V3).await;
+    }
+
+    #[tokio::test]
+    async fn the_next_table_version_takes_the_parsed_manifests() {
+        let dir = TempDir::new().unwrap();
+        let (catalog, mut table) = new_table(FormatVersion::V2, &dir).await;
+        for n in 0..6 {
+            table = append(&catalog, &table, n, None).await;
+        }
+        // Parse everything into this version's cache.
+        let (_, manifests) = live_files(&table).await;
+        assert_eq!(manifests, 6);
+
+        let next = append(&catalog, &table, 6, None).await;
+        let ident = table.identifier().clone();
+        let reloaded = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(reloaded.metadata_location(), next.metadata_location());
+        let (reloaded, carried) = reloaded.with_manifests_of(&table).await.unwrap();
+        // The six manifests the version before had; the seventh is new.
+        assert_eq!(carried, 6);
+        let (files, manifests) = live_files(&reloaded).await;
+        assert_eq!((files.len(), manifests), (7, 7));
     }
 }
