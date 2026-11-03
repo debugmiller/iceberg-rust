@@ -1232,4 +1232,129 @@ mod merge_tests {
         let (files, manifests) = live_files(&reloaded).await;
         assert_eq!((files.len(), manifests), (7, 7));
     }
+
+    /// What S3 Tables' compaction leaves: for each file it rewrites, one manifest adding the new file and one that
+    /// only records the old file as deleted. They merge too, and the deleted entries stay as they were.
+    #[tokio::test]
+    async fn manifest_merge_consolidates_delete_only_manifests_and_keeps_their_entries() {
+        use uuid::Uuid;
+
+        use crate::spec::{ManifestWriterBuilder, Struct};
+        use crate::transaction::snapshot::{
+            ManifestProcess, MergeManifestProcess, SnapshotProducer,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let (_catalog, table) = new_table(FormatVersion::V2, &dir).await;
+        let schema = table.metadata().current_schema().clone();
+        let spec = table.metadata().default_partition_spec().as_ref().clone();
+        let file = |name: String, rows: u64| {
+            DataFileBuilder::default()
+                .partition_spec_id(0)
+                .content(DataContentType::Data)
+                .file_path(format!(
+                    "{}/data/{name}.parquet",
+                    table.metadata().location()
+                ))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(rows)
+                .partition(Struct::empty())
+                .build()
+                .unwrap()
+        };
+        let output = |tag: String| {
+            table
+                .file_io()
+                .new_output(format!(
+                    "{}/metadata/merge-test-{tag}.avro",
+                    table.metadata().location()
+                ))
+                .unwrap()
+        };
+        let compaction_snapshot = 99;
+        let mut manifests = Vec::new();
+        for i in 0..4i64 {
+            let mut writer = ManifestWriterBuilder::new(
+                output(format!("add{i}")),
+                Some(compaction_snapshot),
+                schema.clone(),
+                spec.clone(),
+            )
+            .build_v2_data();
+            writer
+                .add_file(file(format!("new{i}"), 100), 50 + i)
+                .unwrap();
+            let mut added = writer.write_manifest_file().await.unwrap();
+            added.sequence_number = 60;
+            added.min_sequence_number = 50;
+            manifests.push(added);
+
+            let mut writer = ManifestWriterBuilder::new(
+                output(format!("del{i}")),
+                Some(compaction_snapshot),
+                schema.clone(),
+                spec.clone(),
+            )
+            .build_v2_data();
+            writer
+                .add_delete_file(file(format!("old{i}"), 10), 3 + i, Some(3 + i))
+                .unwrap();
+            let mut deleted = writer.write_manifest_file().await.unwrap();
+            deleted.sequence_number = 60;
+            deleted.min_sequence_number = 3;
+            assert!(deleted.has_deleted_files() && !deleted.has_added_files());
+            manifests.push(deleted);
+        }
+
+        let mut producer = SnapshotProducer::new(&table, Uuid::new_v4(), HashMap::new(), vec![]);
+        let process = MergeManifestProcess {
+            min_count: 5,
+            target_size_bytes: 8 * 1024 * 1024,
+        };
+        let merged = process
+            .process_manifests(&mut producer, manifests)
+            .await
+            .unwrap();
+        assert_eq!(merged.len(), 1, "eight manifests became one");
+        assert_eq!(merged[0].existing_files_count, Some(4));
+        assert_eq!(merged[0].deleted_files_count, Some(4));
+
+        let manifest = table.object_cache().get_manifest(&merged[0]).await.unwrap();
+        let mut seen = BTreeMap::new();
+        for entry in manifest.entries() {
+            let name = entry
+                .data_file()
+                .file_path()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_string();
+            seen.insert(
+                name,
+                (entry.status(), entry.snapshot_id(), entry.sequence_number()),
+            );
+        }
+        assert_eq!(seen.len(), 8);
+        for i in 0..4i64 {
+            assert_eq!(
+                seen[&format!("new{i}.parquet")],
+                (
+                    ManifestStatus::Existing,
+                    Some(compaction_snapshot),
+                    Some(50 + i)
+                ),
+                "a live file keeps the snapshot and sequence number it had"
+            );
+            assert_eq!(
+                seen[&format!("old{i}.parquet")],
+                (
+                    ManifestStatus::Deleted,
+                    Some(compaction_snapshot),
+                    Some(3 + i)
+                ),
+                "a deleted file stays deleted, as the earlier snapshot recorded"
+            );
+        }
+    }
 }

@@ -26,9 +26,9 @@ use uuid::Uuid;
 use crate::error::{Result, invalid_data};
 use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary,
-    TableProperties, update_snapshot_summaries,
+    ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter, ManifestWriterBuilder,
+    Operation, Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
+    StructType, Summary, TableProperties, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -114,13 +114,13 @@ pub(crate) const MANIFEST_MERGE_TARGET_SIZE_BYTES: u64 = 8 * 1024 * 1024;
 /// Merges the small data manifests a snapshot carries forward, so a table committed to many times by
 /// fast appends (one manifest per commit) does not grow a manifest list that every reader must open.
 ///
-/// Only manifests that hold nothing but live entries (no deleted ones), belong to the default
-/// partition spec, are not encrypted, and are under half of [`MANIFEST_MERGE_TARGET_SIZE_BYTES`] are
-/// candidates; the manifest this commit adds is never one, as its entries take their sequence number
+/// Only manifests that belong to the default partition spec, are not encrypted, and are under half of
+/// [`MANIFEST_MERGE_TARGET_SIZE_BYTES`] are candidates, deleted entries included (S3 Tables' compaction writes a
+/// one-entry manifest for each file it removes, and they are most of a compacted table's manifests); the manifest this commit adds is never one, as its entries take their sequence number
 /// when the commit is made. Once `min_count` candidates have built up they are packed, oldest first,
 /// into manifests of at most the target size, and each pack of two or more is rewritten as one
-/// manifest whose entries are `Existing`, with the snapshot id, sequence numbers and first row id
-/// they had. A pack's manifest takes the place of its first member in the list.
+/// manifest whose entries are `Existing` (or still `Deleted`), with the snapshot id, sequence numbers and
+/// first row id they had. A pack's manifest takes the place of its first member in the list.
 pub(crate) struct MergeManifestProcess {
     pub(crate) min_count: usize,
     pub(crate) target_size_bytes: u64,
@@ -141,12 +141,17 @@ impl ManifestProcess for MergeManifestProcess {
             m.content == ManifestContentType::Data
                 && m.partition_spec_id == spec_id
                 && m.added_snapshot_id != snapshot_id
-                && !m.has_deleted_files()
                 && m.key_metadata.is_none()
                 && m.manifest_length >= 0
                 && (m.manifest_length as u64) < self.target_size_bytes / 2
         };
-        if manifests.iter().filter(|m| candidate(m)).count() < self.min_count.max(2) {
+        let candidates = manifests.iter().filter(|m| candidate(m)).count();
+        if candidates < self.min_count.max(2) {
+            tracing::info!(
+                "manifest merge: {candidates} of {} manifests could be merged, fewer than {}",
+                manifests.len(),
+                self.min_count.max(2)
+            );
             return Ok(manifests);
         }
 
@@ -184,13 +189,21 @@ impl ManifestProcess for MergeManifestProcess {
                         mergeable = false;
                         break;
                     }
-                    writer.add_existing_entry(entry.as_ref().clone())?;
+                    let entry = entry.as_ref().clone();
+                    match entry.status {
+                        ManifestStatus::Deleted => writer.add_deleted_entry_as_is(entry)?,
+                        _ => writer.add_existing_entry(entry)?,
+                    }
                 }
                 if !mergeable {
                     break;
                 }
             }
             if !mergeable {
+                tracing::warn!(
+                    "manifest merge: left {} manifests alone, an entry has no sequence number",
+                    bin.len()
+                );
                 continue;
             }
             let merged = writer.write_manifest_file().await?;
@@ -199,14 +212,20 @@ impl ManifestProcess for MergeManifestProcess {
             }
         }
 
-        Ok(manifests
+        let before = manifests.len();
+        let manifests: Vec<ManifestFile> = manifests
             .into_iter()
             .enumerate()
             .filter_map(|(i, m)| match merged_into.remove(&i) {
                 None => Some(m),
                 Some(replacement) => replacement,
             })
-            .collect())
+            .collect();
+        tracing::info!(
+            "manifest merge: {candidates} candidates, {before} manifests became {}",
+            manifests.len()
+        );
+        Ok(manifests)
     }
 }
 
@@ -416,7 +435,7 @@ impl<'a> SnapshotProducer<'a> {
         let format_version = self.table.metadata().format_version();
         let manifest_entries = added_data_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
-                .status(crate::spec::ManifestStatus::Added)
+                .status(ManifestStatus::Added)
                 .data_file(data_file);
             if format_version == FormatVersion::V1 {
                 builder.snapshot_id(snapshot_id).build()
