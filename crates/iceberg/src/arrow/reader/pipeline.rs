@@ -605,6 +605,18 @@ impl FileScanTaskReader {
             };
         }
 
+        if let Some(ranges) = task.row_ranges() {
+            let by_position = ArrowReader::build_ranges_row_selection(
+                record_batch_stream_builder.metadata().row_groups(),
+                &selected_row_group_indices,
+                ranges,
+            );
+            row_selection = Some(match row_selection {
+                None => by_position,
+                Some(other) => other.intersection(&by_position),
+            });
+        }
+
         if let Some(row_selection) = row_selection {
             record_batch_stream_builder =
                 record_batch_stream_builder.with_row_selection(row_selection);

@@ -150,6 +150,14 @@ pub struct FileScanTask {
     /// over the network.
     #[builder(default)]
     key_metadata: Option<Box<[u8]>>,
+
+    /// Only these rows of the file, as sorted, disjoint, half-open ranges `[start, end)` of row
+    /// positions (the `_pos` of a row: its index in the file, counting rows that deletes remove).
+    /// `None` reads every row. The reader turns the ranges into a Parquet row selection, so with a
+    /// page index it reads only the pages that hold a selected row. It combines with the
+    /// predicate and the deletes: a row is returned only if all of them keep it.
+    #[builder(default)]
+    row_ranges: Option<Vec<(u64, u64)>>,
 }
 
 impl FileScanTask {
@@ -266,6 +274,11 @@ impl FileScanTask {
     /// Returns the key metadata for the encrypted data file.
     pub fn key_metadata(&self) -> Option<&[u8]> {
         self.key_metadata.as_deref()
+    }
+
+    /// Returns the row positions to read as sorted, disjoint `[start, end)` ranges, or `None` for every row.
+    pub fn row_ranges(&self) -> Option<&[(u64, u64)]> {
+        self.row_ranges.as_deref()
     }
 
     fn validate(&self) -> Result<()> {
@@ -472,6 +485,8 @@ mod _serde {
         case_sensitive: bool,
         #[serde(default)]
         key_metadata: Option<Box<[u8]>>,
+        #[serde(default)]
+        row_ranges: Option<Vec<(u64, u64)>>,
     }
 
     #[derive(Serialize)]
@@ -507,6 +522,8 @@ mod _serde {
         case_sensitive: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         key_metadata: Option<&'a [u8]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        row_ranges: Option<&'a [(u64, u64)]>,
     }
 
     fn partition_type(
@@ -555,6 +572,7 @@ mod _serde {
                 sort_order: value.sort_order.as_ref(),
                 case_sensitive: value.case_sensitive,
                 key_metadata: value.key_metadata.as_deref(),
+                row_ranges: value.row_ranges.as_deref(),
             })
         }
     }
@@ -605,6 +623,7 @@ mod _serde {
                 .with_sort_order(value.sort_order)
                 .with_case_sensitive(value.case_sensitive)
                 .with_key_metadata(value.key_metadata)
+                .with_row_ranges(value.row_ranges)
                 .build()
         }
     }

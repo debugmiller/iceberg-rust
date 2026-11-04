@@ -27,6 +27,57 @@ use crate::delete_vector::DeleteVector;
 use crate::error::Result;
 
 impl ArrowReader {
+    /// A `RowSelection` that keeps only the rows at the given positions, for the row groups that are selected.
+    ///
+    /// `ranges` are sorted, disjoint, half-open `[start, end)` ranges of positions counted from the start of the
+    /// file. As with [`Self::build_deletes_row_selection`], the selection covers only the selected row groups
+    /// (all of them when `selected_row_groups` is `None`), and skips a whole row group none of the ranges touch.
+    pub(super) fn build_ranges_row_selection(
+        row_group_metadata_list: &[RowGroupMetaData],
+        selected_row_groups: &Option<Vec<usize>>,
+        ranges: &[(u64, u64)],
+    ) -> RowSelection {
+        let mut selectors: Vec<RowSelector> = Vec::new();
+        let mut base: u64 = 0;
+        let mut next_range = 0;
+        for (idx, row_group) in row_group_metadata_list.iter().enumerate() {
+            let rows = row_group.num_rows() as u64;
+            let end = base + rows;
+            let selected = selected_row_groups
+                .as_ref()
+                .is_none_or(|groups| groups.contains(&idx));
+            if selected {
+                let mut at = base;
+                while next_range < ranges.len() && ranges[next_range].0 < end {
+                    let (lo, hi) = ranges[next_range];
+                    let lo = lo.max(base);
+                    let hi = hi.min(end);
+                    if lo < hi {
+                        if lo > at {
+                            selectors.push(RowSelector::skip((lo - at) as usize));
+                        }
+                        selectors.push(RowSelector::select((hi - lo) as usize));
+                        at = hi;
+                    }
+                    // A range that runs past this row group continues in the next one.
+                    if ranges[next_range].1 > end {
+                        break;
+                    }
+                    next_range += 1;
+                }
+                if at < end {
+                    selectors.push(RowSelector::skip((end - at) as usize));
+                }
+            } else {
+                while next_range < ranges.len() && ranges[next_range].1 <= end {
+                    next_range += 1;
+                }
+            }
+            base = end;
+        }
+        selectors.into()
+    }
+
     /// computes a `RowSelection` from positional delete indices.
     ///
     /// Using the Parquet page index, we build a `RowSelection` that rejects rows that are indicated
@@ -1121,5 +1172,136 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
         assert!(err.message().contains("expected 5 from record_count"));
+    }
+
+    fn selected_positions(selection: RowSelection) -> Vec<u64> {
+        let mut at = 0u64;
+        let mut out = Vec::new();
+        for s in Vec::<RowSelector>::from(selection) {
+            if !s.skip {
+                out.extend(at..at + s.row_count as u64);
+            }
+            at += s.row_count as u64;
+        }
+        out
+    }
+
+    #[test]
+    fn row_ranges_select_exactly_those_positions_across_row_groups() {
+        let descr = get_test_schema_descr();
+        let columns: Vec<_> = descr
+            .columns()
+            .iter()
+            .map(|c| ColumnChunkMetaData::builder(c.clone()).build().unwrap())
+            .collect();
+        let groups: Vec<_> = [10i64, 10, 10]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| build_test_row_group_meta(descr.clone(), columns.clone(), *n, i as i16))
+            .collect();
+        // A range inside group 0, one that crosses from 0 into 1, a single row in 2, none in the rest of 1.
+        let ranges = [(2, 4), (9, 12), (25, 26)];
+        let all = ArrowReader::build_ranges_row_selection(&groups, &None, &ranges);
+        assert_eq!(selected_positions(all), vec![2, 3, 9, 10, 11, 25]);
+
+        // Only group 1 selected: the selection covers its rows alone, numbered from 0 there.
+        let one = ArrowReader::build_ranges_row_selection(&groups, &Some(vec![1]), &ranges);
+        assert_eq!(selected_positions(one), vec![0, 1]);
+
+        // Groups 0 and 2 selected: a range of the skipped group 1 must not shift the later ones.
+        let two = ArrowReader::build_ranges_row_selection(&groups, &Some(vec![0, 2]), &ranges);
+        assert_eq!(selected_positions(two), vec![2, 3, 9, 15]);
+
+        // No range touches a group: it is skipped whole, and nothing is selected at all.
+        let none = ArrowReader::build_ranges_row_selection(&groups, &None, &[]);
+        assert!(selected_positions(none).is_empty());
+    }
+
+    /// A file of 30 ids in three row groups, read with scattered positions: exactly those rows come back, in order,
+    /// whether or not a position delete removes one of them.
+    #[tokio::test]
+    async fn test_row_ranges_read_only_those_rows() {
+        use arrow_array::Int32Array;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let data_file_path = format!("{table_location}/data.parquet");
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(0..30),
+        )])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(&data_file_path).unwrap(),
+            arrow_schema.clone(),
+            Some(props),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let read = |ranges: Option<Vec<(u64, u64)>>| {
+            let table_schema = table_schema.clone();
+            let data_file_path = data_file_path.clone();
+            async move {
+                let reader =
+                    ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+                let task = FileScanTask::builder()
+                    .with_file_size_in_bytes(std::fs::metadata(&data_file_path).unwrap().len())
+                    .with_start(0)
+                    .with_length(0)
+                    .with_record_count(Some(30))
+                    .with_data_file_path(data_file_path)
+                    .with_data_file_format(DataFileFormat::Parquet)
+                    .with_schema(table_schema)
+                    .with_project_field_ids(vec![1])
+                    .with_row_ranges(ranges)
+                    .with_case_sensitive(false)
+                    .build()
+                    .unwrap();
+                let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+                let batches: Vec<RecordBatch> = reader
+                    .read(tasks)
+                    .unwrap()
+                    .stream()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                batches
+                    .iter()
+                    .flat_map(|b| {
+                        b.column(0)
+                            .as_primitive::<arrow_array::types::Int32Type>()
+                            .values()
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<i32>>()
+            }
+        };
+
+        assert_eq!(read(None).await.len(), 30);
+        assert_eq!(read(Some(vec![(2, 3), (9, 12), (25, 26)])).await, vec![
+            2, 9, 10, 11, 25
+        ]);
+        assert!(read(Some(vec![])).await.is_empty());
     }
 }
