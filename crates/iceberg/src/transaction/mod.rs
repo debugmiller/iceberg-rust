@@ -55,6 +55,7 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+mod rewrite_files;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -75,6 +76,7 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::rewrite_files::RewriteFilesAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
 pub use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -149,6 +151,11 @@ impl Transaction {
     /// Creates a fast append action.
     pub fn fast_append(&self) -> FastAppendAction {
         FastAppendAction::new()
+    }
+
+    /// Creates a rewrite files action, which replaces data files with others in one snapshot.
+    pub fn rewrite_files(&self) -> RewriteFilesAction {
+        RewriteFilesAction::new()
     }
 
     /// Creates replace sort order action.

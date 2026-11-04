@@ -254,6 +254,8 @@ pub(crate) struct SnapshotProducer<'a> {
     commit_uuid: Uuid,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    // Data files this snapshot removes, only counted in the summary (the operation rewrites the manifests).
+    removed_data_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -273,8 +275,15 @@ impl<'a> SnapshotProducer<'a> {
             commit_uuid,
             snapshot_properties,
             added_data_files,
+            removed_data_files: vec![],
             manifest_counter: (0..),
         }
+    }
+
+    /// Names the data files the snapshot removes, so its summary counts them.
+    pub(crate) fn with_removed_data_files(mut self, removed_data_files: Vec<DataFile>) -> Self {
+        self.removed_data_files = removed_data_files;
+        self
     }
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
@@ -370,7 +379,10 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_id
     }
 
-    fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
+    pub(crate) fn new_manifest_writer(
+        &mut self,
+        content: ManifestContentType,
+    ) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}-m{}.{}",
             self.table.metadata().metadata_location()?,
@@ -483,7 +495,10 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        if self.added_data_files.is_empty()
+            && self.removed_data_files.is_empty()
+            && self.snapshot_properties.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
                 "No added data files or added snapshot properties found when write a manifest file",
@@ -533,6 +548,14 @@ impl<'a> SnapshotProducer<'a> {
 
         for data_file in &self.added_data_files {
             summary_collector.add_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
+        for data_file in &self.removed_data_files {
+            summary_collector.remove_file(
                 data_file,
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),
