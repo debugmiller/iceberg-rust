@@ -17,6 +17,9 @@
 
 //! Parquet file data reader
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
@@ -34,6 +37,8 @@ const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
 /// Matches DataFusion's default `ParquetOptions::metadata_size_hint`.
 const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
 
+#[cfg(test)]
+mod dictionary_tests;
 mod file_reader;
 mod metadata_cache;
 mod options;
@@ -62,6 +67,7 @@ pub struct ArrowReaderBuilder {
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     metadata_cache: Option<ParquetMetadataCache>,
+    dictionary_field_ids: HashSet<i32>,
     runtime: Runtime,
 }
 
@@ -79,6 +85,7 @@ impl ArrowReaderBuilder {
             bloom_filter_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
             metadata_cache: None,
+            dictionary_field_ids: HashSet::new(),
             runtime,
         }
     }
@@ -158,6 +165,15 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Reads the listed Iceberg field ids as `Dictionary(Int32, Utf8)` instead of `Utf8`, with the same values,
+    /// when they are top-level `string` fields of a task's schema. Other ids (a field the file lacks comes out as
+    /// all nulls of the dictionary type) are ignored. Off unless called. Counting a dictionary's keys is much
+    /// cheaper than hashing its strings, and arrow-rs decodes dictionary-encoded Parquet pages straight into keys.
+    pub fn with_dictionary_field_ids(mut self, ids: impl IntoIterator<Item = i32>) -> Self {
+        self.dictionary_field_ids = ids.into_iter().collect();
+        self
+    }
+
     /// Build the ArrowReader.
     pub fn build(self) -> ArrowReader {
         ArrowReader {
@@ -174,6 +190,7 @@ impl ArrowReaderBuilder {
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
             metadata_cache: self.metadata_cache,
+            dictionary_field_ids: Arc::new(self.dictionary_field_ids),
         }
     }
 }
@@ -193,4 +210,5 @@ pub struct ArrowReader {
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     metadata_cache: Option<ParquetMetadataCache>,
+    dictionary_field_ids: Arc<HashSet<i32>>,
 }

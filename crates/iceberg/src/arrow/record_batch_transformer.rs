@@ -565,6 +565,7 @@ pub(crate) struct RecordBatchTransformerBuilder {
     projected_iceberg_field_ids: Vec<i32>,
     constant_fields: HashMap<i32, ColumnConstant>,
     virtual_fields: HashSet<i32>,
+    dictionary_field_ids: HashSet<i32>,
 }
 
 /// How a metadata (or identity-partition) column's values are supplied.
@@ -636,7 +637,15 @@ impl RecordBatchTransformerBuilder {
             projected_iceberg_field_ids: projected_iceberg_field_ids.to_vec(),
             constant_fields: HashMap::new(),
             virtual_fields: HashSet::new(),
+            dictionary_field_ids: HashSet::new(),
         }
+    }
+
+    /// Top-level `string` fields with these ids come out as `Dictionary(Int32, Utf8)` (a file batch read with that
+    /// type passes through; one read as `Utf8` is cast), and when the file lacks one it is an all-null dictionary.
+    pub(crate) fn with_dictionary_field_ids(mut self, ids: HashSet<i32>) -> Self {
+        self.dictionary_field_ids = ids;
+        self
     }
 
     /// Add a scalar constant value for a specific field ID.
@@ -729,6 +738,7 @@ impl RecordBatchTransformerBuilder {
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
             constant_fields: self.constant_fields,
             virtual_fields: self.virtual_fields,
+            dictionary_field_ids: self.dictionary_field_ids,
             batch_transform: None,
         }
     }
@@ -776,6 +786,9 @@ pub(crate) struct RecordBatchTransformer {
     // Iceberg projection rules (name mapping / initial-default / null)
     virtual_fields: HashSet<i32>,
 
+    // Top-level string fields delivered as dictionaries (see the builder).
+    dictionary_field_ids: HashSet<i32>,
+
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
     batch_transform: Option<BatchTransform>,
@@ -818,6 +831,7 @@ impl RecordBatchTransformer {
                     &self.projected_iceberg_field_ids,
                     &self.constant_fields,
                     &self.virtual_fields,
+                    &self.dictionary_field_ids,
                 )?);
 
                 self.process_record_batch(record_batch)?
@@ -838,8 +852,39 @@ impl RecordBatchTransformer {
         projected_iceberg_field_ids: &[i32],
         constant_fields: &HashMap<i32, ColumnConstant>,
         virtual_fields: &HashSet<i32>,
+        dictionary_field_ids: &HashSet<i32>,
     ) -> Result<BatchTransform> {
-        let mapped_unprojected_arrow_schema = Arc::new(schema_to_arrow_schema(snapshot_schema)?);
+        let mut mapped_unprojected_arrow_schema = schema_to_arrow_schema(snapshot_schema)?;
+        if !dictionary_field_ids.is_empty() {
+            let fields: Vec<FieldRef> = mapped_unprojected_arrow_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    let wanted = try_get_field_id_from_metadata(field)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|id| dictionary_field_ids.contains(&id))
+                        && matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8);
+                    if wanted {
+                        Arc::new(
+                            Field::new(
+                                field.name(),
+                                DataType::Dictionary(
+                                    Box::new(DataType::Int32),
+                                    Box::new(DataType::Utf8),
+                                ),
+                                field.is_nullable(),
+                            )
+                            .with_metadata(field.metadata().clone()),
+                        )
+                    } else {
+                        Arc::clone(field)
+                    }
+                })
+                .collect();
+            mapped_unprojected_arrow_schema = ArrowSchema::new(fields);
+        }
+        let mapped_unprojected_arrow_schema = Arc::new(mapped_unprojected_arrow_schema);
         let field_id_to_mapped_schema_map =
             Self::build_field_id_to_arrow_schema_map(&mapped_unprojected_arrow_schema)?;
 
@@ -1372,6 +1417,10 @@ impl RecordBatchTransformer {
 
             // Wrap in Run-End Encoding
             create_ree_array(values_array)
+        } else if let DataType::Dictionary(_, value_type) = target_type {
+            // A column the file lacks (or an initial default), for a field read as a dictionary.
+            let values = create_primitive_array_repeated(value_type, prim_lit, num_rows)?;
+            Ok(cast(&values, target_type)?)
         } else {
             // Non-REE type (simple arrays for non-constant fields)
             create_primitive_array_repeated(target_type, prim_lit, num_rows)

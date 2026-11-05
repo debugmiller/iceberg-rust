@@ -20,11 +20,11 @@
 //! predicates, row-group / row selection, and delete handling into a stream
 //! of transformed Arrow `RecordBatch`es.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::{
@@ -35,8 +35,9 @@ use parquet::encryption::decrypt::FileDecryptionProperties;
 use super::metadata_cache::MetadataKey;
 use super::row_lineage::synthesize_row_id_column;
 use super::{
-    ArrowFileReader, ArrowReader, ParquetMetadataCache, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
-    apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
+    ArrowFileReader, ArrowReader, ParquetMetadataCache, ParquetReadOptions,
+    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -78,6 +79,7 @@ impl ArrowReader {
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
             metadata_cache: self.metadata_cache,
+            dictionary_field_ids: self.dictionary_field_ids,
             scan_metrics: scan_metrics.clone(),
         };
 
@@ -121,6 +123,61 @@ const PRUNABLE_METADATA_FIELDS: &[i32] = &[
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
 ];
 
+/// The file's Arrow schema with the top-level string columns whose field ids are in `ids` (and that are
+/// `string` in the Iceberg `schema`) typed as `Dictionary(Int32, Utf8)`, field metadata kept. `None` when no
+/// column changes.
+fn dictionary_hint(
+    arrow_schema: &ArrowSchemaRef,
+    schema: &crate::spec::Schema,
+    ids: &HashSet<i32>,
+) -> Option<ArrowSchemaRef> {
+    if ids.is_empty() {
+        return None;
+    }
+    let mut changed = false;
+    let fields: Vec<Arc<Field>> = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let id = field
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .and_then(|id| id.parse::<i32>().ok());
+            let wanted = id.is_some_and(|id| {
+                ids.contains(&id)
+                    && schema.as_struct().field_by_id(id).is_some_and(|f| {
+                        f.field_type.as_primitive_type()
+                            == Some(&crate::spec::PrimitiveType::String)
+                    })
+            });
+            if wanted
+                && matches!(
+                    field.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                )
+            {
+                changed = true;
+                Arc::new(
+                    Field::new(
+                        field.name(),
+                        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                        field.is_nullable(),
+                    )
+                    .with_metadata(field.metadata().clone()),
+                )
+            } else {
+                Arc::clone(field)
+            }
+        })
+        .collect();
+    changed.then(|| {
+        Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            arrow_schema.metadata().clone(),
+        ))
+    })
+}
+
 /// Per-scan state for processing [`FileScanTask`]s. Created once per
 /// [`ArrowReader::read`] call and cloned per task.
 #[derive(Clone)]
@@ -133,6 +190,7 @@ struct FileScanTaskReader {
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     metadata_cache: Option<ParquetMetadataCache>,
+    dictionary_field_ids: Arc<HashSet<i32>>,
     scan_metrics: ScanMetrics,
 }
 
@@ -197,6 +255,7 @@ impl FileScanTaskReader {
             &task,
             missing_field_ids,
             install_row_number,
+            &self.dictionary_field_ids,
         )?;
 
         // Build the stream reader, reusing the already-opened file reader
@@ -324,7 +383,8 @@ impl FileScanTaskReader {
         // that come back from the file, such as type promotion, default column insertion,
         // column re-ordering, partition constants, and virtual field addition (like _file)
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
+                .with_dictionary_field_ids(self.dictionary_field_ids.as_ref().clone());
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -655,6 +715,7 @@ impl FileScanTaskReader {
         task: &FileScanTask,
         missing_field_ids: bool,
         install_row_number: bool,
+        dictionary_field_ids: &HashSet<i32>,
     ) -> Result<ArrowReaderMetadata> {
         // Schema resolution follows the Iceberg Column Projection rule:
         // "Columns in Iceberg data files are selected by field id."
@@ -664,7 +725,7 @@ impl FileScanTaskReader {
         // otherwise, use applyNameMapping() followed by pruneColumns() when configured, or
         // addFallbackIds() followed by pruneColumnsFallback() for position-based fallback.
         // The fast path returns early without materializing an owned schema.
-        let arrow_schema = if missing_field_ids {
+        let base = if missing_field_ids {
             let schema = if let Some(name_mapping) = task.name_mapping() {
                 apply_name_mapping_to_arrow_schema(
                     Arc::clone(arrow_metadata.schema()),
@@ -676,15 +737,23 @@ impl FileScanTaskReader {
             // Coerce INT96 timestamp columns before building the stream reader to avoid
             // i64 overflow in arrow-rs. Apply this after assigning any missing field IDs
             // so the final schema contains both changes.
-            coerce_int96_timestamps(&schema, task.schema()).unwrap_or(schema)
-        } else if let Some(coerced) =
-            coerce_int96_timestamps(arrow_metadata.schema(), task.schema())
-        {
-            coerced
-        } else if install_row_number {
-            Arc::clone(arrow_metadata.schema())
+            Some(coerce_int96_timestamps(&schema, task.schema()).unwrap_or(schema))
         } else {
-            return Ok(arrow_metadata);
+            coerce_int96_timestamps(arrow_metadata.schema(), task.schema())
+        };
+
+        // Ask for the listed string columns as dictionaries, so arrow-rs decodes dictionary-encoded
+        // pages straight into keys.
+        let dictionary = dictionary_hint(
+            base.as_ref().unwrap_or(arrow_metadata.schema()),
+            task.schema(),
+            dictionary_field_ids,
+        );
+        let arrow_schema = match (dictionary, base) {
+            (Some(hinted), _) => hinted,
+            (None, Some(base)) => base,
+            (None, None) if install_row_number => Arc::clone(arrow_metadata.schema()),
+            (None, None) => return Ok(arrow_metadata),
         };
 
         let mut options = ArrowReaderOptions::new().with_schema(Arc::clone(&arrow_schema));
