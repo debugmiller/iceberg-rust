@@ -82,6 +82,7 @@ impl BasicDeleteFileLoader {
             parquet_read_options,
             self.scan_metrics.bytes_read_counter(),
             key_metadata,
+            None,
         )
         .await?;
 

@@ -35,6 +35,7 @@ const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
 const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
 
 mod file_reader;
+mod metadata_cache;
 mod options;
 mod pipeline;
 mod positional_deletes;
@@ -43,6 +44,7 @@ mod projection;
 mod row_filter;
 mod row_lineage;
 pub use file_reader::ArrowFileReader;
+pub use metadata_cache::{ParquetMetadataCache, ParquetMetadataCacheStats};
 pub(crate) use options::ParquetReadOptions;
 use predicate_visitor::{CollectFieldIdVisitor, PredicateConverter};
 use projection::{
@@ -59,6 +61,7 @@ pub struct ArrowReaderBuilder {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    metadata_cache: Option<ParquetMetadataCache>,
     runtime: Runtime,
 }
 
@@ -75,6 +78,7 @@ impl ArrowReaderBuilder {
             row_selection_enabled: false,
             bloom_filter_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
+            metadata_cache: None,
             runtime,
         }
     }
@@ -145,6 +149,15 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Keeps the parsed Parquet footers of the data files this reader opens in `cache`, so that several tasks on one
+    /// file (byte ranges of it) fetch and decode the footer and page indexes once. Off by default. The cache can be
+    /// shared by many readers. A cached footer is not re-read, so the reader's read-ahead of a file's tail (in a
+    /// caching `FileIO`) does not see the tail again.
+    pub fn with_metadata_cache(mut self, cache: ParquetMetadataCache) -> Self {
+        self.metadata_cache = Some(cache);
+        self
+    }
+
     /// Build the ArrowReader.
     pub fn build(self) -> ArrowReader {
         ArrowReader {
@@ -160,6 +173,7 @@ impl ArrowReaderBuilder {
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
+            metadata_cache: self.metadata_cache,
         }
     }
 }
@@ -178,4 +192,5 @@ pub struct ArrowReader {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    metadata_cache: Option<ParquetMetadataCache>,
 }

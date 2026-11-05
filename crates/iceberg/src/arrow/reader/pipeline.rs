@@ -32,9 +32,10 @@ use parquet::arrow::{
 };
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
+use super::metadata_cache::MetadataKey;
 use super::row_lineage::synthesize_row_id_column;
 use super::{
-    ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
+    ArrowFileReader, ArrowReader, ParquetMetadataCache, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
     apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
@@ -76,6 +77,7 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
+            metadata_cache: self.metadata_cache,
             scan_metrics: scan_metrics.clone(),
         };
 
@@ -130,6 +132,7 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    metadata_cache: Option<ParquetMetadataCache>,
     scan_metrics: ScanMetrics,
 }
 
@@ -152,6 +155,7 @@ impl FileScanTaskReader {
             parquet_read_options,
             self.scan_metrics.bytes_read_counter(),
             task.key_metadata(),
+            self.metadata_cache.as_ref(),
         )
         .await?;
 
@@ -792,17 +796,47 @@ impl ArrowReader {
         parquet_read_options: ParquetReadOptions,
         bytes_read: &Arc<AtomicU64>,
         key_metadata: Option<&[u8]>,
+        metadata_cache: Option<&ParquetMetadataCache>,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let parquet_file = file_io.new_input(data_file_path)?;
         let counting_reader =
             CountingFileRead::new(parquet_file.reader().await?, Arc::clone(bytes_read));
-        Self::build_parquet_reader(
-            Box::new(counting_reader),
-            file_size_in_bytes,
-            parquet_read_options,
+        let Some(cache) = metadata_cache else {
+            return Self::build_parquet_reader(
+                Box::new(counting_reader),
+                file_size_in_bytes,
+                parquet_read_options,
+                key_metadata,
+            )
+            .await;
+        };
+        // The cached footer is what loading gives before any task adapts it, and the indexes loaded with it are part of
+        // the key. The file reader is made either way, as the stream fetches the column chunks through it.
+        let key = MetadataKey::new(
+            data_file_path,
             key_metadata,
+            parquet_read_options.preload_column_index(),
+            parquet_read_options.preload_offset_index(),
+        );
+        let mut reader = ArrowFileReader::new(
+            FileMetadata {
+                size: file_size_in_bytes,
+            },
+            Box::new(counting_reader),
         )
-        .await
+        .with_parquet_read_options(parquet_read_options);
+        let arrow_reader_options = Self::build_arrow_reader_options(key_metadata)?;
+        let arrow_metadata = cache
+            .get_or_load(key, async {
+                ArrowReaderMetadata::load_async(&mut reader, arrow_reader_options)
+                    .await
+                    .map_err(|e| {
+                        Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
+                            .with_source(e)
+                    })
+            })
+            .await?;
+        Ok((reader, arrow_metadata))
     }
 
     async fn build_parquet_reader(
