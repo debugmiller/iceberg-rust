@@ -41,7 +41,7 @@ use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluato
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::FileIO;
 use crate::metadata_columns::{
-    RESERVED_FIELD_ID_PARTITION, get_metadata_field_id, is_metadata_column_name,
+    RESERVED_FIELD_ID_PARTITION, get_metadata_field_id, is_metadata_column_name, is_metadata_field,
 };
 use crate::runtime::Runtime;
 use crate::spec::{DataContentType, Schema, SchemaRef, SnapshotRef, SortOrderRef, StructType};
@@ -132,6 +132,8 @@ pub struct TableScanBuilder<'a> {
     table: &'a Table,
     // Defaults to none which means select all columns
     column_names: Option<Vec<String>>,
+    // Selected by field id, nested fields included; takes the place of `column_names` when set
+    field_ids: Option<Vec<i32>>,
     snapshot_id: Option<i64>,
     batch_size: Option<usize>,
     case_sensitive: bool,
@@ -151,6 +153,7 @@ impl<'a> TableScanBuilder<'a> {
         Self {
             table,
             column_names: None,
+            field_ids: None,
             snapshot_id: None,
             batch_size: None,
             case_sensitive: true,
@@ -188,23 +191,40 @@ impl<'a> TableScanBuilder<'a> {
     /// Select all columns.
     pub fn select_all(mut self) -> Self {
         self.column_names = None;
+        self.field_ids = None;
         self
     }
 
     /// Select empty columns.
+    ///
+    /// The scan reads no column data and yields batches with no columns but the right row counts.
     pub fn select_empty(mut self) -> Self {
         self.column_names = Some(vec![]);
+        self.field_ids = None;
         self
     }
 
     /// Select some columns of the table.
     pub fn select(mut self, column_names: impl IntoIterator<Item = impl ToString>) -> Self {
+        self.field_ids = None;
         self.column_names = Some(
             column_names
                 .into_iter()
                 .map(|item| item.to_string())
                 .collect(),
         );
+        self
+    }
+
+    /// Select columns by field id, which may be those of fields nested in structs (and of list elements and map
+    /// keys and values). A top-level id (or one of a struct or list as a whole) selects the column with all it
+    /// holds. The id of a field nested in a struct selects only that field: the batches then carry the table schema
+    /// pruned to the selected ids (a struct holds only its selected children, in table order), and the Parquet
+    /// reader reads only the leaves under them. Columns come in the order their top-level ancestors were first
+    /// selected. An id the schema does not have is an error when the scan is built.
+    pub fn select_field_ids(mut self, field_ids: impl IntoIterator<Item = i32>) -> Self {
+        self.column_names = None;
+        self.field_ids = Some(field_ids.into_iter().collect());
         self
     }
 
@@ -311,8 +331,23 @@ impl<'a> TableScanBuilder<'a> {
         };
 
         let schema = snapshot.schema(self.table.metadata())?;
-        let field_ids =
-            collect_scan_field_ids(&schema, self.column_names.as_deref(), self.case_sensitive)?;
+        let field_ids = match &self.field_ids {
+            Some(ids) => ids
+                .iter()
+                .map(|id| {
+                    if is_metadata_field(*id) || schema.field_by_id(*id).is_some() {
+                        Ok(*id)
+                    } else {
+                        Err(invalid_data!(
+                            "Field id {id} not found in table. Schema: {schema}"
+                        ))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => {
+                collect_scan_field_ids(&schema, self.column_names.as_deref(), self.case_sensitive)?
+            }
+        };
         let snapshot_bound_predicate =
             bind_scan_predicate(&schema, self.filter.as_ref(), self.case_sensitive)?;
         let name_mapping = self

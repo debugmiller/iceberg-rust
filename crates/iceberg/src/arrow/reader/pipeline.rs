@@ -123,6 +123,68 @@ const PRUNABLE_METADATA_FIELDS: &[i32] = &[
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
 ];
 
+/// The schema and the top-level field ids the batches are built from.
+///
+/// When every projected id is a top-level column (or a metadata column) that is the task's schema and ids as
+/// they are. When some id is nested in a struct (or list or map), the schema is pruned to the selected ids
+/// (a selected struct or list is kept whole, a selected child keeps only itself and its ancestors) and the ids
+/// are those of the top-level columns that remain, in the order they were first selected, so a batch carries the
+/// pruned struct types and no unread child is filled with nulls.
+fn projected_view(task: &FileScanTask) -> Result<(crate::spec::SchemaRef, Vec<i32>)> {
+    use crate::spec::{NestedField, Schema, Type, prune_columns};
+
+    fn holds(field: &NestedField, id: i32) -> bool {
+        if field.id == id {
+            return true;
+        }
+        match field.field_type.as_ref() {
+            Type::Struct(s) => s.fields().iter().any(|f| holds(f, id)),
+            Type::List(l) => holds(&l.element_field, id),
+            Type::Map(m) => holds(&m.key_field, id) || holds(&m.value_field, id),
+            _ => false,
+        }
+    }
+
+    let schema = task.schema();
+    let ids = task.project_field_ids();
+    let nested = |id: &i32| {
+        !is_metadata_field(*id)
+            && schema.as_struct().field_by_id(*id).is_none()
+            && schema.field_by_id(*id).is_some()
+    };
+    if !ids.iter().any(nested) {
+        return Ok((task.schema_ref(), ids.to_vec()));
+    }
+
+    let selected = ids
+        .iter()
+        .copied()
+        .filter(|id| schema.field_by_id(*id).is_some());
+    let Type::Struct(pruned) = prune_columns(schema, selected, true)? else {
+        return Err(invalid_data!("pruning a schema did not give a struct"));
+    };
+    let pruned = Schema::builder()
+        .with_schema_id(schema.schema_id())
+        .with_fields(pruned.fields().iter().cloned())
+        .build()?;
+
+    let mut top_ids: Vec<i32> = Vec::new();
+    for id in ids {
+        let top = if nested(id) {
+            match schema.as_struct().fields().iter().find(|f| holds(f, *id)) {
+                Some(f) => f.id,
+                None => continue,
+            }
+        } else {
+            *id
+        };
+        if !top_ids.contains(&top) {
+            top_ids.push(top);
+        }
+    }
+    Ok((Arc::new(pruned), top_ids))
+}
+
 /// The file's Arrow schema with the top-level string columns whose field ids are in `ids` (and that are
 /// `string` in the Iceberg `schema`) typed as `Dictionary(Int32, Utf8)`, field metadata kept. `None` when no
 /// column changes.
@@ -248,7 +310,11 @@ impl FileScanTaskReader {
                 .iter()
                 .all(|id| PRUNABLE_METADATA_FIELDS.contains(id));
 
-        let install_row_number = need_row_number || metadata_only_projection;
+        // An empty projection (`COUNT(*)`) reads no data column: the RowNumber virtual column is the
+        // row-count source, as for a metadata-only projection.
+        let empty_projection = field_ids.is_empty();
+
+        let install_row_number = need_row_number || metadata_only_projection || empty_projection;
 
         let arrow_metadata = Self::configure_arrow_reader_metadata(
             arrow_metadata,
@@ -348,13 +414,11 @@ impl FileScanTaskReader {
             use_position_fallback, // Whether to use position-based (true) or field-ID-based (false) projection
         )?;
 
-        // A metadata-only projection leaves `project_field_ids_without_metadata` empty,
-        // which `get_arrow_projection_mask` maps to "read all columns" (so `COUNT(*)` still
-        // gets a row count). Downgrade that to "read no data columns": `install_row_number`
-        // put the RowNumber virtual column on every metadata-only projection as a row-count
-        // source independent of the data columns, so the count survives with zero data
-        // columns read. `COUNT(*)` (an empty projection) has no RowNumber and keeps reading
-        // all columns to preserve the row count.
+        // A metadata-only or empty projection leaves `project_field_ids_without_metadata` empty,
+        // which `get_arrow_projection_mask` maps to "read all columns". Downgrade that to "read
+        // no data columns": `install_row_number` put the RowNumber virtual column on every such
+        // projection as a row-count source independent of the data columns, so the count survives
+        // with zero data columns read (`COUNT(*)` included).
         //
         // This runs BEFORE the union so any physical metadata leaf is added onto a `none`
         // base, pruning the read to just that leaf (`union` with an `all` base stays `all`).
@@ -382,8 +446,9 @@ impl FileScanTaskReader {
         // RecordBatchTransformer performs any transformations required on the RecordBatches
         // that come back from the file, such as type promotion, default column insertion,
         // column re-ordering, partition constants, and virtual field addition (like _file)
+        let (transformer_schema, transformer_field_ids) = projected_view(&task)?;
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
+            RecordBatchTransformerBuilder::new(transformer_schema, &transformer_field_ids)
                 .with_dictionary_field_ids(self.dictionary_field_ids.as_ref().clone());
 
         // Add the _file metadata column if it's in the projected fields
@@ -3910,5 +3975,204 @@ mod tests {
         // A bare COUNT(*)-style empty projection must still report the row count.
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn test_empty_projection_reads_no_data_columns() {
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_str().unwrap();
+
+        let empty = metadata_projection_task(
+            write_parquet_with_wide_column(dir, "empty_wide.parquet", vec![], vec![]),
+            id_and_wide_schema(),
+            vec![],
+        );
+        let (batches, empty_bytes) = scan_task(empty).await;
+        assert!(batches.iter().all(|b| b.num_columns() == 0));
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+
+        let with_data = metadata_projection_task(
+            write_parquet_with_wide_column(dir, "empty_wide_ref.parquet", vec![], vec![]),
+            id_and_wide_schema(),
+            vec![2],
+        );
+        let (_, with_data_bytes) = scan_task(with_data).await;
+        assert!(
+            empty_bytes < with_data_bytes,
+            "an empty projection should read fewer bytes than one of the wide column: \
+             {empty_bytes} vs {with_data_bytes}"
+        );
+    }
+
+    /// Tables for the nested projection tests: `id` (1), a struct `s` (2) of `a` (5), `b` (6, wide strings) and a
+    /// struct `inner` (7) of `x` (8) and `y` (9, wide strings), and a list `l` (3) of structs of `p` (11) and `q` (12).
+    mod nested {
+        use serde_json::{Value, json};
+
+        use super::*;
+        use crate::arrow::schema_to_arrow_schema;
+        use crate::spec::{ListType, StructType};
+
+        fn prim(id: i32, name: &str, t: PrimitiveType) -> Arc<NestedField> {
+            NestedField::optional(id, name, Type::Primitive(t)).into()
+        }
+
+        pub(super) fn schema(with_c: bool) -> SchemaRef {
+            let mut s_fields = vec![
+                prim(5, "a", PrimitiveType::Int),
+                prim(6, "b", PrimitiveType::String),
+                NestedField::optional(
+                    7,
+                    "inner",
+                    Type::Struct(StructType::new(vec![
+                        prim(8, "x", PrimitiveType::Int),
+                        prim(9, "y", PrimitiveType::String),
+                    ])),
+                )
+                .into(),
+            ];
+            if with_c {
+                s_fields.push(prim(10, "c", PrimitiveType::Int));
+            }
+            Arc::new(
+                Schema::builder()
+                    .with_schema_id(1)
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                        NestedField::optional(2, "s", Type::Struct(StructType::new(s_fields)))
+                            .into(),
+                        NestedField::optional(
+                            3,
+                            "l",
+                            Type::List(ListType::new(
+                                NestedField::list_element(
+                                    13,
+                                    Type::Struct(StructType::new(vec![
+                                        prim(11, "p", PrimitiveType::Int),
+                                        prim(12, "q", PrimitiveType::String),
+                                    ])),
+                                    true,
+                                )
+                                .into(),
+                            )),
+                        )
+                        .into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            )
+        }
+
+        /// 300,000 characters (more than the footer prefetch, so the file is not read whole) that do not compress away.
+        fn wide(i: usize) -> String {
+            (0..300000)
+                .map(|j| (b'a' + ((i * 31 + j * j * 7 + j / 3) % 26) as u8) as char)
+                .collect()
+        }
+
+        pub(super) fn write(dir: &str, name: &str) -> String {
+            let rows: Vec<Value> = (0..3usize)
+                .map(|i| {
+                    json!({
+                        "id": i,
+                        "s": {"a": 10 + i, "b": wide(i), "inner": {"x": 20 + i, "y": wide(i + 9)}},
+                        "l": [{"p": 30 + i, "q": wide(i + 3)}, {"p": 40 + i, "q": null}],
+                    })
+                })
+                .collect();
+            let old = schema(false);
+            let fields = schema_to_arrow_schema(&old).unwrap().fields().to_vec();
+            let batch = serde_arrow::to_record_batch(&fields, &rows).unwrap();
+            let path = format!("{dir}/{name}");
+            let mut writer =
+                ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            path
+        }
+
+        pub(super) fn task(path: &str, schema: &SchemaRef, ids: Vec<i32>) -> FileScanTask {
+            metadata_projection_task(path.to_string(), schema.clone(), ids)
+        }
+
+        pub(super) fn json_of(batch: &RecordBatch) -> Value {
+            serde_arrow::from_record_batch(batch).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nested_child_reads_only_its_leaf() {
+        use serde_json::json;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_str().unwrap();
+        let path = nested::write(dir, "n.parquet");
+        let schema = nested::schema(false);
+
+        let (whole, whole_bytes) = scan_task(nested::task(&path, &schema, vec![2])).await;
+        let (a, a_bytes) = scan_task(nested::task(&path, &schema, vec![5])).await;
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            nested::json_of(&a[0]),
+            json!([{"s": {"a": 10}}, {"s": {"a": 11}}, {"s": {"a": 12}}])
+        );
+        assert!(
+            a_bytes * 3 < whole_bytes,
+            "one int leaf of the struct should read far less than the struct: {a_bytes} vs {whole_bytes}"
+        );
+
+        // Two levels down.
+        let (x, x_bytes) = scan_task(nested::task(&path, &schema, vec![8])).await;
+        assert_eq!(
+            nested::json_of(&x[0]),
+            json!([{"s": {"inner": {"x": 20}}}, {"s": {"inner": {"x": 21}}}, {"s": {"inner": {"x": 22}}}])
+        );
+        assert!(x_bytes * 3 < whole_bytes);
+
+        // Several fields, from two levels and two columns, in the order of first selection; the struct's
+        // children come in table order.
+        let (many, _) = scan_task(nested::task(&path, &schema, vec![8, 1, 5])).await;
+        assert_eq!(many[0].schema().fields().len(), 2);
+        assert_eq!(many[0].schema().field(0).name(), "s");
+        assert_eq!(many[0].schema().field(1).name(), "id");
+        assert_eq!(
+            nested::json_of(&many[0])[0],
+            json!({"s": {"a": 10, "inner": {"x": 20}}, "id": 0})
+        );
+
+        // A struct selected whole with one of its children also selected stays whole.
+        let (both, _) = scan_task(nested::task(&path, &schema, vec![5, 2])).await;
+        assert_eq!(both, whole);
+
+        // A child of a struct inside a list.
+        let (p, p_bytes) = scan_task(nested::task(&path, &schema, vec![11])).await;
+        assert_eq!(
+            nested::json_of(&p[0])[1],
+            json!({"l": [{"p": 31}, {"p": 41}]})
+        );
+        let (l, l_bytes) = scan_task(nested::task(&path, &schema, vec![3])).await;
+        assert!(p_bytes < l_bytes);
+        assert_eq!(nested::json_of(&l[0])[1]["l"][0]["p"], json!(31));
+    }
+
+    #[tokio::test]
+    async fn test_nested_child_added_since_the_file_was_written_is_null() {
+        use serde_json::json;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_str().unwrap();
+        let path = nested::write(dir, "old.parquet");
+        let evolved = nested::schema(true);
+
+        let (c, _) = scan_task(nested::task(&path, &evolved, vec![10])).await;
+        assert_eq!(
+            nested::json_of(&c[0]),
+            json!([{"s": {"c": null}}, {"s": {"c": null}}, {"s": {"c": null}}])
+        );
+        let (ac, _) = scan_task(nested::task(&path, &evolved, vec![10, 5])).await;
+        assert_eq!(
+            nested::json_of(&ac[0])[2],
+            json!({"s": {"a": 12, "c": null}})
+        );
     }
 }
