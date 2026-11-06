@@ -58,10 +58,10 @@ impl RowFilterFactory for IdPeriod {
         _task: &FileScanTask,
         parquet_schema: &SchemaDescriptor,
         _arrow_schema: &ArrowSchema,
-    ) -> Result<Option<Box<dyn ArrowPredicate>>> {
+    ) -> Result<Vec<Box<dyn ArrowPredicate>>> {
         let leaf = find_leaf_by_field_id(parquet_schema, 1).expect("id leaf");
         let n = self.ids_per_period;
-        Ok(Some(Box::new(ArrowPredicateFn::new(
+        Ok(vec![Box::new(ArrowPredicateFn::new(
             ProjectionMask::leaves(parquet_schema, [leaf]),
             move |batch: RecordBatch| {
                 let ids = batch
@@ -71,7 +71,7 @@ impl RowFilterFactory for IdPeriod {
                     ids.iter().map(|v| Some(v.is_some_and(|v| v % 10_000 < n))),
                 ))
             },
-        ))))
+        ))])
     }
 }
 
@@ -83,8 +83,8 @@ impl RowFilterFactory for NoFilter {
         _: &FileScanTask,
         _: &SchemaDescriptor,
         _: &ArrowSchema,
-    ) -> Result<Option<Box<dyn ArrowPredicate>>> {
-        Ok(None)
+    ) -> Result<Vec<Box<dyn ArrowPredicate>>> {
+        Ok(vec![])
     }
 }
 

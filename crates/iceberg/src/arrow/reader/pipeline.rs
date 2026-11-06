@@ -717,14 +717,12 @@ impl FileScanTaskReader {
             }
         }
 
-        if let Some(factory) = &self.row_filter_factory
-            && let Some(predicate) = factory.row_filter(
+        if let Some(factory) = &self.row_filter_factory {
+            row_filter_predicates.extend(factory.row_filter(
                 &task,
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema().as_ref(),
-            )?
-        {
-            row_filter_predicates.push(predicate);
+            )?);
         }
         if !row_filter_predicates.is_empty() {
             record_batch_stream_builder = record_batch_stream_builder.with_row_filter(

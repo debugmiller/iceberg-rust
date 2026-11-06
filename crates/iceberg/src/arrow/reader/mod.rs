@@ -65,21 +65,21 @@ use projection::{
     find_leaf_by_field_id,
 };
 
-/// Supplies an extra row filter for each file a reader opens, on top of the one the task's predicate gives.
+/// Supplies extra row filters for each file a reader opens, on top of the one the task's predicate gives.
 ///
 /// The reader calls [`RowFilterFactory::row_filter`] once per file task, after the file's footer is read. The
-/// returned predicate is appended to the Parquet `RowFilter` (after the task predicate's, so it sees only rows
-/// that one kept). Parquet then decodes the predicate's columns first and fetches and decodes the pages of the
+/// returned predicates are appended to the Parquet `RowFilter` (after the task predicate's, in the order given,
+/// each seeing only the rows the ones before it kept, so the cheap ones belong first). Parquet then decodes the predicate's columns first and fetches and decodes the pages of the
 /// other projected columns only where rows were kept, which needs the page index, so a reader with a factory
 /// loads it. Rows the filter drops are not returned: a caller that cannot let the reader drop them must not
 /// return a predicate that does. `_pos` and `_row_id` of the rows that remain, positional deletes and
 /// [`FileScanTask::row_ranges`] are unaffected.
 ///
-/// Returning `Ok(None)` reads the file as if there were no factory.
+/// Returning no predicates reads the file as if there were no factory.
 pub trait RowFilterFactory: Send + Sync {
     /// `parquet_schema` is the file's; `arrow_schema` is the file's Arrow schema after the reader applied the
     /// task's name mapping or fallback ids, so its fields carry `PARQUET:field_id` metadata to resolve columns
-    /// by field id. The predicate's `ProjectionMask` is over `parquet_schema`'s leaves, and the batch it is
+    /// by field id. A predicate's `ProjectionMask` is over `parquet_schema`'s leaves, and the batch it is
     /// evaluated on holds those leaves in file order, in the file's types (a struct with only the masked
     /// children).
     fn row_filter(
@@ -87,7 +87,7 @@ pub trait RowFilterFactory: Send + Sync {
         task: &FileScanTask,
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchema,
-    ) -> Result<Option<Box<dyn ArrowPredicate>>>;
+    ) -> Result<Vec<Box<dyn ArrowPredicate>>>;
 }
 
 /// Builder to create ArrowReader
