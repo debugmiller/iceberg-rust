@@ -74,9 +74,6 @@ pub(crate) fn assert_last_updated_seq_all(batches: &[RecordBatch], expected: Opt
     }
 }
 
-/// A change made to a `DataFileBuilder` before the fixture builds the file from it.
-pub(crate) type FileEdit = Box<dyn Fn(&mut DataFileBuilder)>;
-
 pub(crate) struct TableTestFixture {
     pub(crate) table_location: String,
     pub(crate) table: Table,
@@ -1015,22 +1012,6 @@ impl TableTestFixture {
         &mut self,
         sort_order_ids: [Option<i32>; 4],
     ) {
-        let edits = sort_order_ids.map(|id| {
-            Box::new(move |b: &mut DataFileBuilder| {
-                if let Some(id) = id {
-                    b.sort_order_id(id);
-                }
-            }) as FileEdit
-        });
-        self.setup_manifest_files_editing(edits).await;
-    }
-
-    /// Writes a manifest with one live "Added" data-file entry (`1.parquet`, `2.parquet`, ...) per edit, partitioned
-    /// on `x` = 100, 200, ..., each `DataFile` built after its edit has been applied to the builder.
-    pub(crate) async fn setup_manifest_files_editing<const N: usize>(
-        &mut self,
-        edits: [FileEdit; N],
-    ) {
         let current_snapshot = self.table.metadata().current_snapshot().unwrap();
         let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
         let current_partition_spec = self.table.metadata().default_partition_spec();
@@ -1044,7 +1025,7 @@ impl TableTestFixture {
         )
         .build_v2_data();
 
-        for (i, edit) in edits.into_iter().enumerate() {
+        for (i, sort_order_id) in sort_order_ids.into_iter().enumerate() {
             let mut data_file_builder = DataFileBuilder::default();
             data_file_builder
                 .partition_spec_id(0)
@@ -1056,7 +1037,9 @@ impl TableTestFixture {
                 .partition(Struct::from_iter([Some(Literal::long(
                     100 * (i as i64 + 1),
                 ))]));
-            edit(&mut data_file_builder);
+            if let Some(id) = sort_order_id {
+                data_file_builder.sort_order_id(id);
+            }
             let data_file = data_file_builder.build().unwrap();
 
             writer
