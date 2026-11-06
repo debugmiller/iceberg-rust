@@ -795,7 +795,10 @@ mod tests {
         let tx = Transaction::new(&table);
 
         // z is top level and required; person.age is required inside an optional struct.
-        let action = tx.update_schema().make_optional("z").make_optional("person.age");
+        let action = tx
+            .update_schema()
+            .make_optional("z")
+            .make_optional("person.age");
 
         let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
         let updates = action_commit.take_updates();

@@ -181,8 +181,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::arrow::ArrowReader;
-    use crate::arrow::ParquetReadOptions;
+    use crate::arrow::{ArrowReader, ParquetReadOptions};
     use crate::io::FileIO;
 
     fn write(dir: &TempDir, name: &str) -> (String, u64) {

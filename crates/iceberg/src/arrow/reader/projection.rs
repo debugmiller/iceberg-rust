@@ -131,7 +131,12 @@ impl ArrowReader {
         for field_id in field_ids {
             if let Some(field) = iceberg_schema_of_task.field_by_id(*field_id) {
                 if matches!(field.field_type.as_ref(), Type::Variant(_)) {
-                    if iceberg_schema_of_task.as_struct().fields().iter().any(|f| f.id == *field_id) {
+                    if iceberg_schema_of_task
+                        .as_struct()
+                        .fields()
+                        .iter()
+                        .any(|f| f.id == *field_id)
+                    {
                         variant_ids.insert(*field_id);
                         continue;
                     }

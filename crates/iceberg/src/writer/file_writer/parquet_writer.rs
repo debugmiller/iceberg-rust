@@ -750,8 +750,8 @@ mod tests {
     use arrow_array::builder::{Float32Builder, Int32Builder, MapBuilder};
     use arrow_array::types::{Float32Type, Int64Type};
     use arrow_array::{
-        Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, ListArray, MapArray, RecordBatch, StructArray,
+        Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Float32Array, Float64Array,
+        Int32Array, Int64Array, ListArray, MapArray, RecordBatch, StructArray,
     };
     use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
     use arrow_select::concat::concat_batches;

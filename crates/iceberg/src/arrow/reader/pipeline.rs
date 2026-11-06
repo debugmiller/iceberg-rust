@@ -35,7 +35,7 @@ use parquet::encryption::decrypt::FileDecryptionProperties;
 use super::metadata_cache::MetadataKey;
 use super::row_lineage::synthesize_row_id_column;
 use super::{
-    ArrowFileReader, ArrowReader, ParquetMetadataCache, ParquetReadOptions,
+    ArrowFileReader, ArrowReader, ParquetMetadataCache, ParquetReadOptions, RowFilterFactory,
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
     find_leaf_by_field_id,
 };
@@ -80,6 +80,7 @@ impl ArrowReader {
             parquet_read_options: self.parquet_read_options,
             metadata_cache: self.metadata_cache,
             dictionary_field_ids: self.dictionary_field_ids,
+            row_filter_factory: self.row_filter_factory,
             scan_metrics: scan_metrics.clone(),
         };
 
@@ -253,13 +254,15 @@ struct FileScanTaskReader {
     parquet_read_options: ParquetReadOptions,
     metadata_cache: Option<ParquetMetadataCache>,
     dictionary_field_ids: Arc<HashSet<i32>>,
+    row_filter_factory: Option<Arc<dyn RowFilterFactory>>,
     scan_metrics: ScanMetrics,
 }
 
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
         let should_load_page_index = (self.row_selection_enabled && task.predicate().is_some())
-            || !task.deletes().is_empty();
+            || !task.deletes().is_empty()
+            || self.row_filter_factory.is_some();
         let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
 
@@ -625,6 +628,9 @@ impl FileScanTaskReader {
         // by using a `RowSelection`.
         let mut selected_row_group_indices = None;
         let mut row_selection = None;
+        // The predicates of the Parquet `RowFilter`, in the order they are evaluated: the task predicate's, then
+        // the factory's. Each sees only the rows the ones before it kept.
+        let mut row_filter_predicates = Vec::new();
 
         // Filter row groups based on byte range from task.start and task.length.
         // If both start and length are 0, read the entire file (backwards compatibility).
@@ -651,7 +657,7 @@ impl FileScanTaskReader {
                 &iceberg_field_ids,
                 &field_id_map,
             )?;
-            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
+            row_filter_predicates.extend(row_filter.into_predicates());
 
             if self.row_group_filtering_enabled {
                 let predicate_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
@@ -709,6 +715,21 @@ impl FileScanTaskReader {
                     task.schema(),
                 )?;
             }
+        }
+
+        if let Some(factory) = &self.row_filter_factory
+            && let Some(predicate) = factory.row_filter(
+                &task,
+                record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema().as_ref(),
+            )?
+        {
+            row_filter_predicates.push(predicate);
+        }
+        if !row_filter_predicates.is_empty() {
+            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(
+                parquet::arrow::arrow_reader::RowFilter::new(row_filter_predicates),
+            );
         }
 
         let positional_delete_indexes = delete_filter.get_delete_vector(&task);

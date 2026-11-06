@@ -20,9 +20,15 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use arrow_schema::Schema as ArrowSchema;
+use parquet::arrow::arrow_reader::ArrowPredicate;
+use parquet::schema::types::SchemaDescriptor;
+
+use crate::Result;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
+use crate::scan::FileScanTask;
 use crate::util::available_parallelism;
 
 /// Default gap between byte ranges below which they are coalesced into a
@@ -47,6 +53,8 @@ mod positional_deletes;
 mod predicate_visitor;
 mod projection;
 mod row_filter;
+#[cfg(test)]
+mod row_filter_factory_tests;
 mod row_lineage;
 pub use file_reader::ArrowFileReader;
 pub use metadata_cache::{ParquetMetadataCache, ParquetMetadataCacheStats};
@@ -56,6 +64,31 @@ use projection::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
     find_leaf_by_field_id,
 };
+
+/// Supplies an extra row filter for each file a reader opens, on top of the one the task's predicate gives.
+///
+/// The reader calls [`RowFilterFactory::row_filter`] once per file task, after the file's footer is read. The
+/// returned predicate is appended to the Parquet `RowFilter` (after the task predicate's, so it sees only rows
+/// that one kept). Parquet then decodes the predicate's columns first and fetches and decodes the pages of the
+/// other projected columns only where rows were kept, which needs the page index, so a reader with a factory
+/// loads it. Rows the filter drops are not returned: a caller that cannot let the reader drop them must not
+/// return a predicate that does. `_pos` and `_row_id` of the rows that remain, positional deletes and
+/// [`FileScanTask::row_ranges`] are unaffected.
+///
+/// Returning `Ok(None)` reads the file as if there were no factory.
+pub trait RowFilterFactory: Send + Sync {
+    /// `parquet_schema` is the file's; `arrow_schema` is the file's Arrow schema after the reader applied the
+    /// task's name mapping or fallback ids, so its fields carry `PARQUET:field_id` metadata to resolve columns
+    /// by field id. The predicate's `ProjectionMask` is over `parquet_schema`'s leaves, and the batch it is
+    /// evaluated on holds those leaves in file order, in the file's types (a struct with only the masked
+    /// children).
+    fn row_filter(
+        &self,
+        task: &FileScanTask,
+        parquet_schema: &SchemaDescriptor,
+        arrow_schema: &ArrowSchema,
+    ) -> Result<Option<Box<dyn ArrowPredicate>>>;
+}
 
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
@@ -68,6 +101,7 @@ pub struct ArrowReaderBuilder {
     parquet_read_options: ParquetReadOptions,
     metadata_cache: Option<ParquetMetadataCache>,
     dictionary_field_ids: HashSet<i32>,
+    row_filter_factory: Option<Arc<dyn RowFilterFactory>>,
     runtime: Runtime,
 }
 
@@ -86,6 +120,7 @@ impl ArrowReaderBuilder {
             parquet_read_options: ParquetReadOptions::builder().build(),
             metadata_cache: None,
             dictionary_field_ids: HashSet::new(),
+            row_filter_factory: None,
             runtime,
         }
     }
@@ -174,6 +209,12 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Adds a row filter per file from `factory` (see [`RowFilterFactory`]). Off unless called.
+    pub fn with_row_filter_factory(mut self, factory: Arc<dyn RowFilterFactory>) -> Self {
+        self.row_filter_factory = Some(factory);
+        self
+    }
+
     /// Build the ArrowReader.
     pub fn build(self) -> ArrowReader {
         ArrowReader {
@@ -191,6 +232,7 @@ impl ArrowReaderBuilder {
             parquet_read_options: self.parquet_read_options,
             metadata_cache: self.metadata_cache,
             dictionary_field_ids: Arc::new(self.dictionary_field_ids),
+            row_filter_factory: self.row_filter_factory,
         }
     }
 }
@@ -211,4 +253,5 @@ pub struct ArrowReader {
     parquet_read_options: ParquetReadOptions,
     metadata_cache: Option<ParquetMetadataCache>,
     dictionary_field_ids: Arc<HashSet<i32>>,
+    row_filter_factory: Option<Arc<dyn RowFilterFactory>>,
 }
