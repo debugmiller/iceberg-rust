@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
@@ -24,7 +25,7 @@ use typed_builder::TypedBuilder;
 use crate::error::invalid_data;
 use crate::expr::BoundPredicate;
 use crate::spec::{
-    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
+    DataContentType, DataFileFormat, Datum, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
     SchemaRef, SortOrderRef, Struct, StructType,
 };
 use crate::{Error, Result};
@@ -136,6 +137,15 @@ pub struct FileScanTask {
     /// to tell those cases apart.
     #[builder(default)]
     sort_order: Option<SortOrderRef>,
+
+    /// The data file's lower and upper bounds, from its manifest entry, for the fields the scan asked for with
+    /// [`TableScanBuilder::with_bounds_for`](crate::scan::TableScanBuilder::with_bounds_for): empty otherwise. They are
+    /// for the planner that holds the task and are not serialized, so a task read back from its serialized form has
+    /// none.
+    #[builder(default)]
+    lower_bounds: HashMap<i32, Datum>,
+    #[builder(default)]
+    upper_bounds: HashMap<i32, Datum>,
 
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
     case_sensitive: bool,
@@ -264,6 +274,17 @@ impl FileScanTask {
     /// Returns the sort order this file's rows are sorted by, if resolved.
     pub fn sort_order(&self) -> Option<&SortOrderRef> {
         self.sort_order.as_ref()
+    }
+
+    /// The data file's lower bound for `field_id`, from its manifest entry, if the scan asked for it with
+    /// [`TableScanBuilder::with_bounds_for`](crate::scan::TableScanBuilder::with_bounds_for) and the file records one.
+    pub fn lower_bound(&self, field_id: i32) -> Option<&Datum> {
+        self.lower_bounds.get(&field_id)
+    }
+
+    /// The data file's upper bound for `field_id`; see [`lower_bound`](Self::lower_bound).
+    pub fn upper_bound(&self, field_id: i32) -> Option<&Datum> {
+        self.upper_bounds.get(&field_id)
     }
 
     /// Returns whether names are treated as case-sensitive.

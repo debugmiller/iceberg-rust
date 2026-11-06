@@ -52,6 +52,7 @@ pub(crate) struct ManifestFileContext {
     partition_spec: Option<PartitionSpecRef>,
     unified_partition_type: Option<Arc<StructType>>,
     sort_orders: Arc<HashMap<i64, SortOrderRef>>,
+    bounds_field_ids: Arc<Vec<i32>>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -71,6 +72,7 @@ pub(crate) struct ManifestEntryContext {
     pub unified_partition_type: Option<Arc<StructType>>,
     pub sort_order_id: Option<i32>,
     pub sort_order: Option<SortOrderRef>,
+    pub bounds_field_ids: Arc<Vec<i32>>,
 }
 
 impl ManifestFileContext {
@@ -91,6 +93,7 @@ impl ManifestFileContext {
             partition_spec,
             unified_partition_type,
             sort_orders,
+            bounds_field_ids,
         } = self;
 
         let manifest = object_cache.get_manifest(&manifest_file).await?;
@@ -122,6 +125,7 @@ impl ManifestFileContext {
                 unified_partition_type: unified_partition_type.clone(),
                 sort_order_id,
                 sort_order,
+                bounds_field_ids: bounds_field_ids.clone(),
             };
 
             sender
@@ -146,6 +150,17 @@ impl ManifestEntryContext {
             )
             .await?;
 
+        let data_file = self.manifest_entry.data_file();
+        let bounds = |all: &HashMap<i32, crate::spec::Datum>| {
+            self.bounds_field_ids
+                .iter()
+                .filter_map(|id| all.get(id).map(|d| (*id, d.clone())))
+                .collect::<HashMap<_, _>>()
+        };
+        let (lower_bounds, upper_bounds) = (
+            bounds(data_file.lower_bounds()),
+            bounds(data_file.upper_bounds()),
+        );
         FileScanTask::builder()
             .with_file_size_in_bytes(self.manifest_entry.file_size_in_bytes())
             .with_start(0)
@@ -170,6 +185,8 @@ impl ManifestEntryContext {
             .with_key_metadata(self.manifest_entry.data_file.key_metadata().map(Box::from))
             .with_sort_order_id(self.sort_order_id)
             .with_sort_order(self.sort_order)
+            .with_lower_bounds(lower_bounds)
+            .with_upper_bounds(upper_bounds)
             .build()
     }
 
@@ -216,6 +233,9 @@ pub(crate) struct PlanContext {
     /// [`ManifestFileContext`] carries only this narrow map rather than the full table
     /// metadata. Mirrors how `unified_partition_type` carries a precomputed value.
     pub sort_orders: Arc<HashMap<i64, SortOrderRef>>,
+
+    /// The fields whose file bounds each task carries (see `TableScanBuilder::with_bounds_for`).
+    pub bounds_field_ids: Arc<Vec<i32>>,
 }
 
 impl PlanContext {
@@ -347,6 +367,7 @@ impl PlanContext {
                 .cloned(),
             unified_partition_type: self.unified_partition_type.clone(),
             sort_orders: self.sort_orders.clone(),
+            bounds_field_ids: self.bounds_field_ids.clone(),
         }
     }
 }

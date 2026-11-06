@@ -144,6 +144,7 @@ pub struct TableScanBuilder<'a> {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
+    bounds_field_ids: Vec<i32>,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -164,6 +165,7 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             bloom_filter_enabled: false,
+            bounds_field_ids: Vec::new(),
         }
     }
 
@@ -225,6 +227,14 @@ impl<'a> TableScanBuilder<'a> {
     pub fn select_field_ids(mut self, field_ids: impl IntoIterator<Item = i32>) -> Self {
         self.column_names = None;
         self.field_ids = Some(field_ids.into_iter().collect());
+        self
+    }
+
+    /// Has each planned [`FileScanTask`] carry its data file's lower and upper bounds for these fields, from the
+    /// manifest entries planning reads anyway ([`FileScanTask::lower_bound`], [`FileScanTask::upper_bound`]). None by
+    /// default. An id the schema does not have, or a file that records no bound for it, gives no bound.
+    pub fn with_bounds_for(mut self, field_ids: impl IntoIterator<Item = i32>) -> Self {
+        self.bounds_field_ids = field_ids.into_iter().collect();
         self
     }
 
@@ -383,6 +393,7 @@ impl<'a> TableScanBuilder<'a> {
             expression_evaluator_cache: Arc::new(ExpressionEvaluatorCache::new()),
             unified_partition_type,
             sort_orders,
+            bounds_field_ids: Arc::new(self.bounds_field_ids),
         };
 
         Ok(TableScan {
@@ -734,15 +745,15 @@ mod tests {
         RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
         RESERVED_COL_NAME_POS, RESERVED_COL_NAME_SPEC_ID, RESERVED_FIELD_ID_POS,
     };
-    use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
+    use crate::scan::{FileScanTask, FileScanTaskDeleteFile, TableScanBuilder};
     use crate::spec::{
-        DataContentType, DataFileFormat, Datum, Literal, MAIN_BRANCH, MappedField, NameMapping,
-        NestedField, NullOrder, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
-        SortDirection, SortField, SortOrder, Struct, Summary, TableMetadataBuilder,
+        DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, MAIN_BRANCH, MappedField,
+        NameMapping, NestedField, NullOrder, Operation, PartitionSpec, PrimitiveType, Schema,
+        Snapshot, SortDirection, SortField, SortOrder, Struct, Summary, TableMetadataBuilder,
         TableProperties, Transform, Type, UnboundPartitionSpec,
     };
     use crate::table::Table;
-    use crate::test_utils::scan::{TableTestFixture, assert_last_updated_seq_all};
+    use crate::test_utils::scan::{FileEdit, TableTestFixture, assert_last_updated_seq_all};
     use crate::test_utils::test_runtime;
     use crate::{ErrorKind, TableIdent};
 
@@ -1082,6 +1093,62 @@ mod tests {
         assert!(
             unsorted.sort_order().is_none(),
             "the reserved unsorted order (id 0) resolves to no sort_order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_files_carries_the_bounds_asked_for() {
+        let mut fixture = TableTestFixture::new();
+        let bounds = |lower: i64, upper: i64| {
+            Box::new(move |b: &mut DataFileBuilder| {
+                b.lower_bounds(HashMap::from([
+                    (2, Datum::long(lower)),
+                    (3, Datum::long(lower + 1)),
+                ]))
+                .upper_bounds(HashMap::from([
+                    (2, Datum::long(upper)),
+                    (3, Datum::long(upper + 1)),
+                ]));
+            }) as FileEdit
+        };
+        fixture
+            .setup_manifest_files_editing([bounds(10, 20), Box::new(|_| {})])
+            .await;
+        async fn plan(scan: TableScanBuilder<'_>) -> Vec<FileScanTask> {
+            let mut tasks: Vec<FileScanTask> = scan
+                .build()
+                .unwrap()
+                .plan_files()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            tasks.sort_by(|a, b| a.data_file_path().cmp(b.data_file_path()));
+            tasks
+        }
+
+        // Asked for field 3 (and 42, which the table lacks): the first file's bounds for 3 only.
+        let tasks = plan(fixture.table.scan().with_bounds_for([3, 42])).await;
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].lower_bound(3), Some(&Datum::long(11)));
+        assert_eq!(tasks[0].upper_bound(3), Some(&Datum::long(21)));
+        assert_eq!(tasks[0].lower_bound(2), None, "a field not asked for");
+        assert_eq!(tasks[0].upper_bound(42), None);
+        assert_eq!(
+            tasks[1].lower_bound(3),
+            None,
+            "a file that records no bounds"
+        );
+        assert_eq!(tasks[1].upper_bound(3), None);
+
+        // Not asked: no bounds, and the serialized task is what it was.
+        let plain = plan(fixture.table.scan()).await;
+        assert_eq!(plain[0].lower_bound(3), None);
+        assert_eq!(
+            serde_json::to_value(&plain[0]).unwrap(),
+            serde_json::to_value(&tasks[0]).unwrap(),
+            "bounds are not serialized"
         );
     }
 
