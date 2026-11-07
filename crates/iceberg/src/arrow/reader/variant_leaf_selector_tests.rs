@@ -237,3 +237,45 @@ async fn a_selection_outside_the_projection_is_an_error() {
         .await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn naming_no_leaf_of_a_column_skips_it() {
+    let dir = TempDir::new().unwrap();
+    let path = write_file(dir.path().to_str().unwrap());
+    let (batches, bytes) = read(task(&path, vec![1, 2]), Some(Arc::new(Leaves(vec![])))).await;
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 4);
+    assert_eq!(batch.num_columns(), 2);
+    // `id` is read as always; `v` is all null, and typed as the table's.
+    let ids = batch.column_by_name("id").unwrap();
+    assert_eq!(
+        ids.as_primitive::<arrow_array::types::Int32Type>().values(),
+        &[0, 1, 2, 3]
+    );
+    let v = batch.column_by_name("v").unwrap();
+    assert_eq!(v.null_count(), 4);
+    let (plain, all) = read(task(&path, vec![1, 2]), None).await;
+    assert_eq!(
+        v.data_type(),
+        plain[0].column_by_name("v").unwrap().data_type()
+    );
+    assert!(bytes < all, "{bytes} should be fewer than {all}");
+}
+
+#[tokio::test]
+async fn skipping_the_only_column_is_an_error() {
+    let dir = TempDir::new().unwrap();
+    let path = write_file(dir.path().to_str().unwrap());
+    let mut builder = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current());
+    builder = builder.with_variant_leaf_selector(Arc::new(Leaves(vec![])));
+    let tasks =
+        Box::pin(futures::stream::iter(vec![Ok(task(&path, vec![2]))])) as FileScanTaskStream;
+    let result: std::result::Result<Vec<RecordBatch>, _> = builder
+        .build()
+        .read(tasks)
+        .unwrap()
+        .stream()
+        .try_collect()
+        .await;
+    assert!(result.is_err());
+}

@@ -97,7 +97,9 @@ pub trait RowFilterFactory: Send + Sync {
 pub struct RawVariantRead {
     /// The Iceberg field id of the top-level Variant column.
     pub field_id: i32,
-    /// Indexes into the file's Parquet leaves (`parquet_schema.column(i)`) of the column's leaves to read.
+    /// Indexes into the file's Parquet leaves (`parquet_schema.column(i)`) of the column's leaves to read. Empty means the
+    /// caller wants none of the column in this file: nothing of it is read and it comes out null in the table's type, as a
+    /// column the file lacks does (the task must then have another column to read).
     pub leaves: Vec<usize>,
 }
 

@@ -416,11 +416,21 @@ impl FileScanTaskReader {
             )?,
             None => Vec::new(),
         };
-        let raw_field_ids: HashSet<i32> = raw_variants.iter().map(|r| r.field_id).collect();
+        // A column named with no leaves is skipped: nothing of it is read and it comes out null, as a column the file lacks
+        // does. It is not raw (there is no struct to hand over).
+        let raw_field_ids: HashSet<i32> = raw_variants
+            .iter()
+            .filter(|r| !r.leaves.is_empty())
+            .map(|r| r.field_id)
+            .collect();
+        let skipped_field_ids: HashSet<i32> = raw_variants
+            .iter()
+            .filter(|r| r.leaves.is_empty())
+            .map(|r| r.field_id)
+            .collect();
         for raw in &raw_variants {
             let leaves = record_batch_stream_builder.parquet_schema().num_columns();
             if !task.project_field_ids().contains(&raw.field_id)
-                || raw.leaves.is_empty()
                 || raw.leaves.iter().any(|l| *l >= leaves)
             {
                 return Err(invalid_data!(
@@ -431,8 +441,18 @@ impl FileScanTaskReader {
         }
         let project_field_ids_without_metadata: Vec<i32> = project_field_ids_without_metadata
             .into_iter()
-            .filter(|id| !raw_field_ids.contains(id))
+            .filter(|id| !raw_field_ids.contains(id) && !skipped_field_ids.contains(id))
             .collect();
+        if !skipped_field_ids.is_empty()
+            && raw_field_ids.is_empty()
+            && project_field_ids_without_metadata.is_empty()
+            && !install_row_number
+        {
+            return Err(invalid_data!(
+                "a variant read that skips field(s) {:?} leaves the task with nothing to read",
+                skipped_field_ids
+            ));
+        }
 
         // Create projection mask based on field IDs
         // - If file has embedded IDs: field-ID-based projection
