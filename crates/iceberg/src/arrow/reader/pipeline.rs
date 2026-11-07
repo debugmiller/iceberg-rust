@@ -36,6 +36,7 @@ use super::metadata_cache::MetadataKey;
 use super::row_lineage::synthesize_row_id_column;
 use super::{
     ArrowFileReader, ArrowReader, ParquetMetadataCache, ParquetReadOptions, RowFilterFactory,
+    VariantLeafSelector,
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
     find_leaf_by_field_id,
 };
@@ -81,6 +82,7 @@ impl ArrowReader {
             metadata_cache: self.metadata_cache,
             dictionary_field_ids: self.dictionary_field_ids,
             row_filter_factory: self.row_filter_factory,
+            variant_leaf_selector: self.variant_leaf_selector,
             scan_metrics: scan_metrics.clone(),
         };
 
@@ -255,6 +257,7 @@ struct FileScanTaskReader {
     metadata_cache: Option<ParquetMetadataCache>,
     dictionary_field_ids: Arc<HashSet<i32>>,
     row_filter_factory: Option<Arc<dyn RowFilterFactory>>,
+    variant_leaf_selector: Option<Arc<dyn VariantLeafSelector>>,
     scan_metrics: ScanMetrics,
 }
 
@@ -404,18 +407,58 @@ impl FileScanTaskReader {
             .copied()
             .collect();
 
+        // Variant columns the caller reads by leaves and takes raw (see `VariantLeafSelector`).
+        let raw_variants = match &self.variant_leaf_selector {
+            Some(selector) => selector.select(
+                &task,
+                record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema().as_ref(),
+            )?,
+            None => Vec::new(),
+        };
+        let raw_field_ids: HashSet<i32> = raw_variants.iter().map(|r| r.field_id).collect();
+        for raw in &raw_variants {
+            let leaves = record_batch_stream_builder.parquet_schema().num_columns();
+            if !task.project_field_ids().contains(&raw.field_id)
+                || raw.leaves.is_empty()
+                || raw.leaves.iter().any(|l| *l >= leaves)
+            {
+                return Err(invalid_data!(
+                    "a raw variant read of field {} names a column the task does not project or leaves the file lacks",
+                    raw.field_id
+                ));
+            }
+        }
+        let project_field_ids_without_metadata: Vec<i32> = project_field_ids_without_metadata
+            .into_iter()
+            .filter(|id| !raw_field_ids.contains(id))
+            .collect();
+
         // Create projection mask based on field IDs
         // - If file has embedded IDs: field-ID-based projection
         // - If name mapping applied: field-ID-based projection using the IDs the name
         //   mapping assigned to the Arrow schema
         // - Otherwise: position-based fallback projection
-        let mut projection_mask = ArrowReader::get_arrow_projection_mask(
-            &project_field_ids_without_metadata,
-            task.schema(),
-            record_batch_stream_builder.parquet_schema(),
-            record_batch_stream_builder.schema(),
-            use_position_fallback, // Whether to use position-based (true) or field-ID-based (false) projection
-        )?;
+        let mut projection_mask = if project_field_ids_without_metadata.is_empty()
+            && !raw_variants.is_empty()
+        {
+            // Nothing but the raw columns' leaves (an empty list of ids would mean every column).
+            ProjectionMask::none(record_batch_stream_builder.parquet_schema().num_columns())
+        } else {
+            ArrowReader::get_arrow_projection_mask(
+                &project_field_ids_without_metadata,
+                task.schema(),
+                record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema(),
+                use_position_fallback, // Whether to use position-based (true) or field-ID-based (false) projection
+            )?
+        };
+        for raw in &raw_variants {
+            projection_mask.union(&ProjectionMask::leaves(
+                record_batch_stream_builder.parquet_schema(),
+                raw.leaves.iter().copied(),
+            ));
+        }
 
         // A metadata-only or empty projection leaves `project_field_ids_without_metadata` empty,
         // which `get_arrow_projection_mask` maps to "read all columns". Downgrade that to "read
@@ -425,7 +468,10 @@ impl FileScanTaskReader {
         //
         // This runs BEFORE the union so any physical metadata leaf is added onto a `none`
         // base, pruning the read to just that leaf (`union` with an `all` base stays `all`).
-        if project_field_ids_without_metadata.is_empty() && install_row_number {
+        if project_field_ids_without_metadata.is_empty()
+            && install_row_number
+            && raw_variants.is_empty()
+        {
             projection_mask =
                 ProjectionMask::none(record_batch_stream_builder.parquet_schema().num_columns());
         }
@@ -452,7 +498,8 @@ impl FileScanTaskReader {
         let (transformer_schema, transformer_field_ids) = projected_view(&task)?;
         let mut record_batch_transformer_builder =
             RecordBatchTransformerBuilder::new(transformer_schema, &transformer_field_ids)
-                .with_dictionary_field_ids(self.dictionary_field_ids.as_ref().clone());
+                .with_dictionary_field_ids(self.dictionary_field_ids.as_ref().clone())
+                .with_raw_field_ids(raw_field_ids);
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {

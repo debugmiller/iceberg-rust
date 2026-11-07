@@ -566,6 +566,7 @@ pub(crate) struct RecordBatchTransformerBuilder {
     constant_fields: HashMap<i32, ColumnConstant>,
     virtual_fields: HashSet<i32>,
     dictionary_field_ids: HashSet<i32>,
+    raw_field_ids: HashSet<i32>,
 }
 
 /// How a metadata (or identity-partition) column's values are supplied.
@@ -638,7 +639,15 @@ impl RecordBatchTransformerBuilder {
             constant_fields: HashMap::new(),
             virtual_fields: HashSet::new(),
             dictionary_field_ids: HashSet::new(),
+            raw_field_ids: HashSet::new(),
         }
+    }
+
+    /// Top-level fields with these ids come out as the file holds them, whatever their type: no promotion, no
+    /// unshredding (see `VariantLeafSelector`). A batch's type for one may differ from file to file.
+    pub(crate) fn with_raw_field_ids(mut self, ids: HashSet<i32>) -> Self {
+        self.raw_field_ids = ids;
+        self
     }
 
     /// Top-level `string` fields with these ids come out as `Dictionary(Int32, Utf8)` (a file batch read with that
@@ -739,6 +748,7 @@ impl RecordBatchTransformerBuilder {
             constant_fields: self.constant_fields,
             virtual_fields: self.virtual_fields,
             dictionary_field_ids: self.dictionary_field_ids,
+            raw_field_ids: self.raw_field_ids,
             batch_transform: None,
         }
     }
@@ -789,6 +799,9 @@ pub(crate) struct RecordBatchTransformer {
     // Top-level string fields delivered as dictionaries (see the builder).
     dictionary_field_ids: HashSet<i32>,
 
+    // Top-level fields passed through as the file holds them (see the builder).
+    raw_field_ids: HashSet<i32>,
+
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
     batch_transform: Option<BatchTransform>,
@@ -832,6 +845,7 @@ impl RecordBatchTransformer {
                     &self.constant_fields,
                     &self.virtual_fields,
                     &self.dictionary_field_ids,
+                    &self.raw_field_ids,
                 )?);
 
                 self.process_record_batch(record_batch)?
@@ -853,7 +867,9 @@ impl RecordBatchTransformer {
         constant_fields: &HashMap<i32, ColumnConstant>,
         virtual_fields: &HashSet<i32>,
         dictionary_field_ids: &HashSet<i32>,
+        raw_field_ids: &HashSet<i32>,
     ) -> Result<BatchTransform> {
+        let source_by_id = Self::build_field_id_to_arrow_schema_map(source_schema)?;
         let mut mapped_unprojected_arrow_schema = schema_to_arrow_schema(snapshot_schema)?;
         if !dictionary_field_ids.is_empty() {
             let fields: Vec<FieldRef> = mapped_unprojected_arrow_schema
@@ -971,6 +987,18 @@ impl RecordBatchTransformer {
                     return Ok(Arc::new(arrow_field));
                 }
 
+                // A raw column has the type the file gave it.
+                if raw_field_ids.contains(field_id)
+                    && let Some((source_field, _)) = source_by_id.get(field_id)
+                {
+                    return Ok(Arc::new(
+                        source_field
+                            .as_ref()
+                            .clone()
+                            .with_name(source_field.name().clone()),
+                    ));
+                }
+
                 // Regular fields and identity-partitioned constant fields both exist in the
                 // table schema, so use the mapped Arrow field as-is.
                 Ok(field_id_to_mapped_schema_map
@@ -994,6 +1022,7 @@ impl RecordBatchTransformer {
                     field_id_to_mapped_schema_map,
                     constant_fields,
                     virtual_fields,
+                    raw_field_ids,
                 )?,
                 target_schema,
             }),
@@ -1063,6 +1092,7 @@ impl RecordBatchTransformer {
         field_id_to_mapped_schema_map: HashMap<i32, (FieldRef, usize)>,
         constant_fields: &HashMap<i32, ColumnConstant>,
         virtual_fields: &HashSet<i32>,
+        raw_field_ids: &HashSet<i32>,
     ) -> Result<Vec<ColumnSource>> {
         let field_id_to_source_schema_map =
             Self::build_field_id_to_arrow_schema_map(source_schema)?;
@@ -1165,6 +1195,14 @@ impl RecordBatchTransformer {
                             format!("virtual column for field id {field_id} is not present in source batch — ensure ArrowReaderOptions::with_virtual_columns was applied"),
                         ))?;
                     return Ok(ColumnSource::PassThrough { source_index: *source_index });
+                }
+
+                if raw_field_ids.contains(field_id)
+                    && let Some((_, source_index)) = field_id_to_source_schema_map.get(field_id)
+                {
+                    return Ok(ColumnSource::PassThrough {
+                        source_index: *source_index,
+                    });
                 }
 
                 let (target_field, _) =

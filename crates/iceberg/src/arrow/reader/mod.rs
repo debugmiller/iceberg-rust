@@ -56,6 +56,8 @@ mod row_filter;
 #[cfg(test)]
 mod row_filter_factory_tests;
 mod row_lineage;
+#[cfg(test)]
+mod variant_leaf_selector_tests;
 pub use file_reader::ArrowFileReader;
 pub use metadata_cache::{ParquetMetadataCache, ParquetMetadataCacheStats};
 pub(crate) use options::ParquetReadOptions;
@@ -90,6 +92,34 @@ pub trait RowFilterFactory: Send + Sync {
     ) -> Result<Vec<Box<dyn ArrowPredicate>>>;
 }
 
+/// The leaves of one top-level Variant column to read, and to pass through as the file holds them.
+#[derive(Debug, Clone)]
+pub struct RawVariantRead {
+    /// The Iceberg field id of the top-level Variant column.
+    pub field_id: i32,
+    /// Indexes into the file's Parquet leaves (`parquet_schema.column(i)`) of the column's leaves to read.
+    pub leaves: Vec<usize>,
+}
+
+/// Lets the caller read part of a Variant column, as the file stores it.
+///
+/// A file written shredded (S3 Tables compaction does) holds a Variant as `metadata`, `value` and a `typed_value` tree
+/// whose shape differs file to file; the reader normally reads every leaf and rebuilds the table's `metadata` and
+/// `value` from them, which costs more than reading most of the fields. The reader calls
+/// [`VariantLeafSelector::select`] once per file task, after the footer is read, and for each column it returns reads only
+/// the listed leaves and hands the column over *raw*: a struct holding just those children, with the file's own types
+/// (not unshredded, not cast to the table's type, so its type may differ from file to file). Columns not returned read as
+/// before. A column must be a top-level field the task projects, and the leaves must belong to it.
+pub trait VariantLeafSelector: Send + Sync {
+    /// `parquet_schema` is the file's; `arrow_schema` is the file's Arrow schema (as given to [`RowFilterFactory`]).
+    fn select(
+        &self,
+        task: &FileScanTask,
+        parquet_schema: &SchemaDescriptor,
+        arrow_schema: &ArrowSchema,
+    ) -> Result<Vec<RawVariantRead>>;
+}
+
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
     batch_size: Option<usize>,
@@ -102,6 +132,7 @@ pub struct ArrowReaderBuilder {
     metadata_cache: Option<ParquetMetadataCache>,
     dictionary_field_ids: HashSet<i32>,
     row_filter_factory: Option<Arc<dyn RowFilterFactory>>,
+    variant_leaf_selector: Option<Arc<dyn VariantLeafSelector>>,
     runtime: Runtime,
 }
 
@@ -121,6 +152,7 @@ impl ArrowReaderBuilder {
             metadata_cache: None,
             dictionary_field_ids: HashSet::new(),
             row_filter_factory: None,
+            variant_leaf_selector: None,
             runtime,
         }
     }
@@ -215,6 +247,13 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Reads only some leaves of the Variant columns `selector` names, and passes them through raw (see
+    /// [`VariantLeafSelector`]). Off unless called.
+    pub fn with_variant_leaf_selector(mut self, selector: Arc<dyn VariantLeafSelector>) -> Self {
+        self.variant_leaf_selector = Some(selector);
+        self
+    }
+
     /// Build the ArrowReader.
     pub fn build(self) -> ArrowReader {
         ArrowReader {
@@ -233,6 +272,7 @@ impl ArrowReaderBuilder {
             metadata_cache: self.metadata_cache,
             dictionary_field_ids: Arc::new(self.dictionary_field_ids),
             row_filter_factory: self.row_filter_factory,
+            variant_leaf_selector: self.variant_leaf_selector,
         }
     }
 }
@@ -254,4 +294,5 @@ pub struct ArrowReader {
     metadata_cache: Option<ParquetMetadataCache>,
     dictionary_field_ids: Arc<HashSet<i32>>,
     row_filter_factory: Option<Arc<dyn RowFilterFactory>>,
+    variant_leaf_selector: Option<Arc<dyn VariantLeafSelector>>,
 }
