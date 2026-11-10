@@ -176,6 +176,7 @@ mod tests {
 
     use arrow_array::{ArrayRef, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use futures::{StreamExt, TryStreamExt};
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
@@ -300,5 +301,59 @@ mod tests {
         assert!(r.is_err());
         cache.sync().await;
         assert_eq!(cache.stats().entries, 0);
+    }
+
+    #[tokio::test]
+    async fn load_metadata_parses_a_footer_once_for_the_builder_and_the_reader_it_builds() {
+        use crate::runtime::Runtime;
+        use crate::scan::FileScanTask;
+        use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+
+        let dir = TempDir::new().unwrap();
+        let (path, size) = write(&dir, "a.parquet");
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "a", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(size)
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![1])
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+        let cache = ParquetMetadataCache::new(1 << 20);
+        let builder = || {
+            crate::arrow::ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                .with_metadata_cache(cache.clone())
+        };
+
+        let loaded = builder().load_metadata(&task).await.unwrap();
+        assert_eq!(loaded.metadata().num_row_groups(), 10);
+        let stats = cache.stats();
+        assert_eq!((stats.hits, stats.misses), (0, 1));
+
+        // The scan finds the footer parsed.
+        let tasks = futures::stream::iter([Ok(task.clone())]).boxed();
+        let batches: Vec<_> = builder()
+            .build()
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1000);
+        let stats = cache.stats();
+        assert_eq!((stats.hits, stats.misses), (1, 1));
     }
 }

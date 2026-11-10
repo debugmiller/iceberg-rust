@@ -256,6 +256,29 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// The parsed footer of the file `task` reads, loaded as a reader built from this builder loads it: through the
+    /// builder's [`ParquetMetadataCache`] if it has one (so a reader that opens the file afterwards finds it parsed, and a
+    /// load that is running is shared), with the builder's metadata size hint and page index settings. The result is the
+    /// file's own, before the task adapts it (name mapping, coercions). For a caller that wants to know what a scan of
+    /// `task` will read before it reads.
+    pub async fn load_metadata(
+        &self,
+        task: &FileScanTask,
+    ) -> Result<parquet::arrow::arrow_reader::ArrowReaderMetadata> {
+        let bytes_read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_reader, metadata) = ArrowReader::open_parquet_file(
+            task.data_file_path(),
+            &self.file_io,
+            task.file_size_in_bytes(),
+            self.parquet_read_options.clone(),
+            &bytes_read,
+            task.key_metadata(),
+            self.metadata_cache.as_ref(),
+        )
+        .await?;
+        Ok(metadata)
+    }
+
     /// Build the ArrowReader.
     pub fn build(self) -> ArrowReader {
         ArrowReader {
