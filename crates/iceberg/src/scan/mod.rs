@@ -330,7 +330,12 @@ impl<'a> TableScanBuilder<'a> {
             }
         };
 
-        let schema = snapshot.schema(self.table.metadata())?;
+        // A scan of the table as it is now reads it under its current schema, as Java's does: a column renamed or dropped since
+        // the last snapshot is read under its new name, or not at all. A scan of a chosen snapshot reads that snapshot's schema.
+        let schema = match self.snapshot_id {
+            Some(_) => snapshot.schema(self.table.metadata())?,
+            None => self.table.metadata().current_schema().clone(),
+        };
         let field_ids = match &self.field_ids {
             Some(ids) => ids
                 .iter()
@@ -1261,6 +1266,101 @@ mod tests {
         // evolution: no rows wrongly pruned and none returned unfiltered.
         let evolved = scan_y_gte_5(&table).await;
         assert_eq!(evolved, baseline);
+    }
+
+    /// A column renamed after the last snapshot is read under its new name by a scan of the current table, and under its old
+    /// one by a scan of that snapshot.
+    #[tokio::test]
+    async fn test_scan_reads_the_current_schema_after_a_rename() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let baseline = scan_y_gte_5(&fixture.table).await;
+        assert!(!baseline.is_empty());
+
+        let current_schema = fixture.table.metadata().current_schema();
+        let renamed = Schema::builder()
+            .with_fields(current_schema.as_struct().fields().iter().map(|f| {
+                if f.name == "y" {
+                    let mut f = (**f).clone();
+                    f.name = "why".to_string();
+                    Arc::new(f)
+                } else {
+                    f.clone()
+                }
+            }))
+            .with_identifier_field_ids(current_schema.identifier_field_ids())
+            .build()
+            .unwrap();
+        let snapshot_id = fixture
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        let metadata =
+            TableMetadataBuilder::new_from_metadata(fixture.table.metadata().clone(), None)
+                .add_current_schema(renamed)
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+        let table = fixture.table.clone().with_metadata(Arc::new(metadata));
+
+        let batches: Vec<_> = table
+            .scan()
+            .select(["why"])
+            .with_filter(Reference::new("why").greater_than_or_equal_to(Datum::long(5)))
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                let col = batch.column_by_name("why").unwrap();
+                let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, baseline);
+        assert!(table.scan().select(["y"]).build().is_err());
+
+        // The snapshot, chosen, has its own schema.
+        let at = scan_y_gte_5_at(&table, snapshot_id).await;
+        assert_eq!(at, baseline);
+    }
+
+    async fn scan_y_gte_5_at(table: &Table, snapshot_id: i64) -> Vec<i64> {
+        let batches: Vec<_> = table
+            .scan()
+            .snapshot_id(snapshot_id)
+            .select(["y"])
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                let col = batch.column_by_name("y").unwrap();
+                let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..arr.len())
+                    .map(|i| arr.value(i))
+                    .filter(|v| *v >= 5)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        values.sort_unstable();
+        values
     }
 
     async fn scan_y_gte_5(table: &Table) -> Vec<i64> {
