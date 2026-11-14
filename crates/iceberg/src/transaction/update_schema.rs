@@ -116,6 +116,7 @@ pub struct UpdateSchemaAction {
     additions: Vec<AddColumn>,
     deletes: Vec<String>,
     optionals: Vec<String>,
+    renames: Vec<(String, String)>,
 }
 
 impl UpdateSchemaAction {
@@ -125,6 +126,7 @@ impl UpdateSchemaAction {
             additions: Vec::new(),
             deletes: Vec::new(),
             optionals: Vec::new(),
+            renames: Vec::new(),
         }
     }
 
@@ -156,6 +158,17 @@ impl UpdateSchemaAction {
     /// At commit time, the column must exist in the current schema; one that is optional already is left as it is.
     pub fn make_optional(mut self, name: impl ToString) -> Self {
         self.optionals.push(name.to_string());
+        self
+    }
+
+    /// Record that a top-level column is renamed from `name` to `new_name`.
+    ///
+    /// Only metadata changes: the column keeps its field id, so files written before read back under the new name.
+    /// At commit time, `name` must be a top-level column of the current schema that this action does not delete, and
+    /// `new_name` must be no other top-level column's name (counting this action's other renames, additions and
+    /// deletions). Nested fields (`a.b`) are not supported.
+    pub fn rename_column(mut self, name: impl ToString, new_name: impl ToString) -> Self {
+        self.renames.push((name.to_string(), new_name.to_string()));
         self
     }
 }
@@ -404,6 +417,48 @@ impl TransactionAction for UpdateSchemaAction {
             })
             .collect::<Result<HashSet<i32>>>()?;
 
+        // --- 1b. Validate renames: top-level columns, by id ---
+        let mut rename_ids: HashMap<i32, String> = HashMap::new();
+        for (name, new_name) in &self.renames {
+            let rejected = |why: String| Error::new(ErrorKind::PreconditionFailed, why);
+            if name.contains(SCHEMA_NAME_DELIMITER) || new_name.contains(SCHEMA_NAME_DELIMITER) {
+                return Err(rejected(format!(
+                    "Cannot rename {name} to {new_name}: only top-level columns can be renamed"
+                )));
+            }
+            if new_name.is_empty() {
+                return Err(rejected(format!(
+                    "Cannot rename {name}: the new name is empty"
+                )));
+            }
+            let field = base_schema
+                .as_struct()
+                .field_by_name(name)
+                .ok_or_else(|| rejected(format!("Cannot rename missing column: {name}")))?;
+            if delete_ids.contains(&field.id) {
+                return Err(rejected(format!(
+                    "Cannot rename a column that is being deleted: {name}"
+                )));
+            }
+            if rename_ids.insert(field.id, new_name.clone()).is_some() {
+                return Err(rejected(format!("Cannot rename {name} twice")));
+            }
+        }
+        // The top-level names once deletes and renames are applied: a rename's new name must clash with none of them.
+        let mut root_names: HashMap<String, i32> = HashMap::new();
+        for f in base_schema.as_struct().fields() {
+            if delete_ids.contains(&f.id) {
+                continue;
+            }
+            let name = rename_ids.get(&f.id).unwrap_or(&f.name).clone();
+            if root_names.insert(name.clone(), f.id).is_some() {
+                return Err(Error::new(
+                    ErrorKind::PreconditionFailed,
+                    format!("Cannot rename a column to {name}: a column has that name"),
+                ));
+            }
+        }
+
         // --- 2. Resolve parents, validate additions, assign IDs, and group by parent ID ---
         // We assign IDs inline (before grouping) to preserve the caller's insertion order,
         // since HashMap iteration order is non-deterministic.
@@ -436,10 +491,8 @@ impl TransactionAction for UpdateSchemaAction {
 
             let parent_id = match &add.parent {
                 None => {
-                    // Root-level: check name conflict against root-level fields.
-                    if let Some(existing) = base_schema.field_by_name(&pending_field.name)
-                        && !delete_ids.contains(&existing.id)
-                    {
+                    // Root-level: check name conflict against root-level fields, as they are once renamed.
+                    if root_names.contains_key(&pending_field.name) {
                         return Err(Error::new(
                             ErrorKind::PreconditionFailed,
                             format!(
@@ -507,6 +560,17 @@ impl TransactionAction for UpdateSchemaAction {
             })
             .collect::<Result<HashSet<i32>>>()?;
         let new_fields = relax_fields(&new_fields, &optional_ids);
+        let new_fields = new_fields
+            .into_iter()
+            .map(|f| match rename_ids.get(&f.id) {
+                Some(new_name) => {
+                    let mut renamed = (*f).clone();
+                    renamed.name = new_name.clone();
+                    Arc::new(renamed)
+                }
+                None => f,
+            })
+            .collect::<Vec<_>>();
         let schema = Schema::builder()
             .with_fields(new_fields)
             .with_identifier_field_ids(base_schema.identifier_field_ids())
@@ -533,8 +597,8 @@ mod tests {
     use as_any::Downcast;
 
     use crate::spec::{
-        DEFAULT_SCHEMA_ID, Literal, NestedField, PrimitiveType, StructType, TableMetadata, Type,
-        VariantType,
+        DEFAULT_SCHEMA_ID, Literal, NestedField, PrimitiveType, Schema, StructType, TableMetadata,
+        Type, VariantType,
     };
     use crate::table::Table;
     use crate::transaction::Transaction;
@@ -825,6 +889,146 @@ mod tests {
             Ok(_) => panic!("should reject a missing column"),
         };
         assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+    }
+
+    async fn renamed(action: UpdateSchemaAction, table: &Table) -> crate::Result<Schema> {
+        let mut action_commit = Arc::new(action).commit(table).await?;
+        match action_commit.take_updates().remove(0) {
+            TableUpdate::AddSchema { schema } => Ok(schema),
+            other => panic!("expected AddSchema, got {other:?}"),
+        }
+    }
+
+    async fn refused(action: UpdateSchemaAction, table: &Table, says: &str) {
+        let err = match renamed(action, table).await {
+            Err(e) => e,
+            Ok(_) => panic!("should be refused: {says}"),
+        };
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+        assert!(err.message().contains(says), "{says}: {}", err.message());
+    }
+
+    #[tokio::test]
+    async fn test_rename_column() {
+        let table = make_v2_table_with_nested();
+        let tx = Transaction::new(&table);
+        let schema = renamed(tx.update_schema().rename_column("z", "zed"), &table)
+            .await
+            .unwrap();
+        assert!(schema.field_by_name("z").is_none());
+        let zed = schema.field_by_name("zed").unwrap();
+        // The same field under its new name: id, type, requiredness and place are kept.
+        assert_eq!(zed.id, 3);
+        assert!(zed.required);
+        assert_eq!(*zed.field_type, Type::Primitive(PrimitiveType::Long));
+        assert_eq!(schema.as_struct().fields()[2].name, "zed");
+        // A struct keeps its fields, now under the new name.
+        let schema = renamed(tx.update_schema().rename_column("person", "who"), &table)
+            .await
+            .unwrap();
+        assert_eq!(schema.field_by_name("who.age").unwrap().id, 6);
+        assert!(schema.field_by_name("person.age").is_none());
+        // An identifier field can be renamed: the id is what identifies it.
+        let schema = renamed(tx.update_schema().rename_column("x", "ex"), &table)
+            .await
+            .unwrap();
+        let mut identifiers = schema.identifier_field_ids().collect::<Vec<_>>();
+        identifiers.sort();
+        assert_eq!(identifiers, vec![1, 2]);
+        assert_eq!(schema.field_by_name("ex").unwrap().id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_rename_with_other_changes() {
+        let table = make_v2_table();
+        let tx = Transaction::new(&table);
+        // Two columns swap names.
+        let schema = renamed(
+            tx.update_schema()
+                .rename_column("y", "z")
+                .rename_column("z", "y"),
+            &table,
+        )
+        .await
+        .unwrap();
+        assert_eq!(schema.field_by_name("y").unwrap().id, 3);
+        assert_eq!(schema.field_by_name("z").unwrap().id, 2);
+        // A column renamed, and a new one given its old name: that one gets a new id.
+        let schema = renamed(
+            tx.update_schema()
+                .rename_column("z", "zed")
+                .add_column(AddColumn::optional(
+                    "z",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            &table,
+        )
+        .await
+        .unwrap();
+        assert_eq!(schema.field_by_name("zed").unwrap().id, 3);
+        assert_eq!(schema.field_by_name("z").unwrap().id, 4);
+        // A column renamed to the name of one deleted in the same change.
+        let schema = renamed(
+            tx.update_schema()
+                .delete_column("z")
+                .rename_column("y", "z"),
+            &table,
+        )
+        .await
+        .unwrap();
+        assert_eq!(schema.field_by_name("z").unwrap().id, 2);
+        assert!(schema.field_by_name("y").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rename_refusals() {
+        let table = make_v2_table_with_nested();
+        let tx = Transaction::new(&table);
+        let update = || tx.update_schema();
+        refused(
+            update().rename_column("nope", "a"),
+            &table,
+            "missing column",
+        )
+        .await;
+        refused(
+            update().rename_column("person.name", "nom"),
+            &table,
+            "top-level",
+        )
+        .await;
+        refused(update().rename_column("z", "a.b"), &table, "top-level").await;
+        refused(update().rename_column("z", ""), &table, "empty").await;
+        refused(update().rename_column("z", "y"), &table, "has that name").await;
+        refused(
+            update().rename_column("z", "w").rename_column("y", "w"),
+            &table,
+            "has that name",
+        )
+        .await;
+        refused(
+            update().rename_column("z", "w").rename_column("z", "v"),
+            &table,
+            "twice",
+        )
+        .await;
+        refused(
+            update().delete_column("z").rename_column("z", "w"),
+            &table,
+            "being deleted",
+        )
+        .await;
+        refused(
+            update()
+                .rename_column("z", "w")
+                .add_column(AddColumn::optional(
+                    "w",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            &table,
+            "already exists",
+        )
+        .await;
     }
 
     #[tokio::test]
