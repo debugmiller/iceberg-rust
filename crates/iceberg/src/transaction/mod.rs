@@ -55,6 +55,7 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+mod manage_snapshots;
 mod rewrite_files;
 mod snapshot;
 mod sort_order;
@@ -76,6 +77,7 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::manage_snapshots::ManageSnapshotsAction;
 pub use crate::transaction::rewrite_files::RewriteFilesAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
@@ -176,6 +178,11 @@ impl Transaction {
     /// Expire snapshots from the table metadata.
     pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
         ExpireSnapshotsAction::new()
+    }
+
+    /// Creates and removes tags, each change guarded by a requirement on the ref at commit.
+    pub fn manage_snapshots(&self) -> ManageSnapshotsAction {
+        ManageSnapshotsAction::new()
     }
 
     /// Commit transaction.

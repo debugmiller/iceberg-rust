@@ -336,6 +336,12 @@ impl TableMetadata {
         self.current_snapshot_id
     }
 
+    /// The table's branches and tags, by name.
+    #[inline]
+    pub fn refs(&self) -> &HashMap<String, SnapshotReference> {
+        &self.refs
+    }
+
     /// Get the snapshot for a reference
     /// Returns an option if the `ref_name` is not found
     #[inline]
