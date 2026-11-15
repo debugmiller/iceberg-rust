@@ -135,6 +135,8 @@ pub struct TableScanBuilder<'a> {
     // Selected by field id, nested fields included; takes the place of `column_names` when set
     field_ids: Option<Vec<i32>>,
     snapshot_id: Option<i64>,
+    // Read a chosen snapshot under the table's current schema rather than the snapshot's
+    current_schema: bool,
     batch_size: Option<usize>,
     case_sensitive: bool,
     filter: Option<Predicate>,
@@ -155,6 +157,7 @@ impl<'a> TableScanBuilder<'a> {
             column_names: None,
             field_ids: None,
             snapshot_id: None,
+            current_schema: false,
             batch_size: None,
             case_sensitive: true,
             filter: None,
@@ -231,6 +234,15 @@ impl<'a> TableScanBuilder<'a> {
     /// Set the snapshot to scan. When not set, it uses current snapshot.
     pub fn snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Reads the chosen snapshot (see [`Self::snapshot_id`]) under the table's current schema rather than the snapshot's,
+    /// as a scan of the current table does: a column added since reads null from the snapshot's files, a renamed one under
+    /// its new name (matched by field id), and a dropped one not at all. Names, the filter and the selected ids are resolved
+    /// against the current schema. Without a chosen snapshot it changes nothing.
+    pub fn with_current_schema(mut self) -> Self {
+        self.current_schema = true;
         self
     }
 
@@ -331,10 +343,11 @@ impl<'a> TableScanBuilder<'a> {
         };
 
         // A scan of the table as it is now reads it under its current schema, as Java's does: a column renamed or dropped since
-        // the last snapshot is read under its new name, or not at all. A scan of a chosen snapshot reads that snapshot's schema.
+        // the last snapshot is read under its new name, or not at all. A scan of a chosen snapshot reads that snapshot's schema,
+        // unless asked to read the current one.
         let schema = match self.snapshot_id {
-            Some(_) => snapshot.schema(self.table.metadata())?,
-            None => self.table.metadata().current_schema().clone(),
+            Some(_) if !self.current_schema => snapshot.schema(self.table.metadata())?,
+            _ => self.table.metadata().current_schema().clone(),
         };
         let field_ids = match &self.field_ids {
             Some(ids) => ids
@@ -1333,6 +1346,152 @@ mod tests {
         // The snapshot, chosen, has its own schema.
         let at = scan_y_gte_5_at(&table, snapshot_id).await;
         assert_eq!(at, baseline);
+    }
+
+    /// The table with its current schema replaced by `evolve(current)`, keeping its snapshots.
+    fn with_evolved_schema(table: &Table, evolve: impl FnOnce(&Schema) -> Schema) -> Table {
+        let evolved = evolve(table.metadata().current_schema());
+        let metadata = TableMetadataBuilder::new_from_metadata(table.metadata().clone(), None)
+            .add_current_schema(evolved)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        table.clone().with_metadata(Arc::new(metadata))
+    }
+
+    /// A chosen snapshot read under the current schema: a column added after it reads null from its files, the others as
+    /// they were. Read under its own schema the snapshot has no such column.
+    #[tokio::test]
+    async fn test_snapshot_scan_with_current_schema_reads_an_added_column_as_null() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let snapshot_id = fixture
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        let baseline = scan_y_gte_5_at(&fixture.table, snapshot_id).await;
+        assert!(!baseline.is_empty());
+        // Above every id the fixture uses (its `last-column-id` is lower than its schema's highest id).
+        let added_id = 1000;
+        let table = with_evolved_schema(&fixture.table, |current| {
+            Schema::builder()
+                .with_fields(current.as_struct().fields().iter().cloned())
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    added_id,
+                    "added",
+                    Type::Primitive(PrimitiveType::String),
+                ))])
+                .with_identifier_field_ids(current.identifier_field_ids())
+                .build()
+                .unwrap()
+        });
+
+        assert!(
+            table
+                .scan()
+                .snapshot_id(snapshot_id)
+                .select(["y", "added"])
+                .build()
+                .is_err()
+        );
+        let batches: Vec<_> = table
+            .scan()
+            .snapshot_id(snapshot_id)
+            .with_current_schema()
+            .select(["y", "added"])
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut values = vec![];
+        let mut rows = 0;
+        for batch in &batches {
+            let added = batch.column_by_name("added").unwrap();
+            assert_eq!(added.logical_null_count(), added.len());
+            rows += batch.num_rows();
+            let y = batch
+                .column_by_name("y")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            values.extend((0..y.len()).map(|i| y.value(i)).filter(|v| *v >= 5));
+        }
+        assert!(rows > 0);
+        values.sort_unstable();
+        assert_eq!(values, baseline);
+    }
+
+    /// A chosen snapshot read under the current schema: a column renamed after it reads under its new name, by field id,
+    /// filter included; the old name is gone.
+    #[tokio::test]
+    async fn test_snapshot_scan_with_current_schema_reads_a_renamed_column() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let baseline = scan_y_gte_5(&fixture.table).await;
+        assert!(!baseline.is_empty());
+        let snapshot_id = fixture
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        let table = with_evolved_schema(&fixture.table, |current| {
+            Schema::builder()
+                .with_fields(current.as_struct().fields().iter().map(|f| {
+                    if f.name == "y" {
+                        let mut f = (**f).clone();
+                        f.name = "why".to_string();
+                        Arc::new(f)
+                    } else {
+                        f.clone()
+                    }
+                }))
+                .with_identifier_field_ids(current.identifier_field_ids())
+                .build()
+                .unwrap()
+        });
+
+        let batches: Vec<_> = table
+            .scan()
+            .snapshot_id(snapshot_id)
+            .with_current_schema()
+            .select(["why"])
+            .with_filter(Reference::new("why").greater_than_or_equal_to(Datum::long(5)))
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                let col = batch.column_by_name("why").unwrap();
+                let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, baseline);
+        assert!(
+            table
+                .scan()
+                .snapshot_id(snapshot_id)
+                .with_current_schema()
+                .select(["y"])
+                .build()
+                .is_err()
+        );
     }
 
     async fn scan_y_gte_5_at(table: &Table, snapshot_id: i64) -> Vec<i64> {
