@@ -697,18 +697,21 @@ impl<'a> SnapshotProducer<'a> {
             })
             .unwrap_or_default();
 
-        let updates = [encryption_key_updates, vec![
-            TableUpdate::AddSnapshot {
-                snapshot: new_snapshot,
-            },
-            TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRANCH.to_string(),
-                reference: SnapshotReference::new(
-                    self.snapshot_id,
-                    SnapshotRetention::branch(None, None, None),
-                ),
-            },
-        ]]
+        let updates = [
+            encryption_key_updates,
+            vec![
+                TableUpdate::AddSnapshot {
+                    snapshot: new_snapshot,
+                },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: MAIN_BRANCH.to_string(),
+                    reference: SnapshotReference::new(
+                        self.snapshot_id,
+                        SnapshotRetention::branch(None, None, None),
+                    ),
+                },
+            ],
+        ]
         .concat();
 
         let requirements = vec![

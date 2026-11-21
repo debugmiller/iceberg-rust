@@ -1196,10 +1196,10 @@ mod tests {
             .unwrap();
         assert_eq!(mapping.fields().len(), 1);
         assert_eq!(mapping.fields()[0].field_id(), Some(1));
-        assert_eq!(mapping.fields()[0].names(), &[
-            "id".to_string(),
-            "record_id".to_string()
-        ]);
+        assert_eq!(
+            mapping.fields()[0].names(),
+            &["id".to_string(), "record_id".to_string()]
+        );
     }
 
     #[test]

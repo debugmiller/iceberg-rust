@@ -316,10 +316,13 @@ fn write_positional_delete(dir: &str, data_path: &str, pos: &[i64]) -> FileScanT
         field("file_path", DataType::Utf8, 2147483546),
         field("pos", DataType::Int64, 2147483545),
     ]));
-    let batch = RecordBatch::try_new(schema.clone(), vec![
-        Arc::new(StringArray::from(vec![data_path; pos.len()])),
-        Arc::new(Int64Array::from(pos.to_vec())),
-    ])
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![data_path; pos.len()])),
+            Arc::new(Int64Array::from(pos.to_vec())),
+        ],
+    )
     .unwrap();
     let path = format!("{dir}/deletes.parquet");
     let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
@@ -349,9 +352,12 @@ async fn deletes_and_row_ranges_still_apply_under_the_filter() {
         factory(3),
     )
     .await;
-    assert_eq!(ids(&batches), vec![
-        0, 2, 10_000, 10_002, 20_000, 20_001, 20_002, 30_000, 30_001, 30_002
-    ]);
+    assert_eq!(
+        ids(&batches),
+        vec![
+            0, 2, 10_000, 10_002, 20_000, 20_001, 20_002, 30_000, 30_001, 30_002
+        ]
+    );
     assert_eq!(
         positions(&batches),
         ids(&batches).iter().map(|&i| i as i64).collect::<Vec<_>>()
@@ -360,9 +366,10 @@ async fn deletes_and_row_ranges_still_apply_under_the_filter() {
     // Ranges [1, 10001) and [20001, 30002): the row ranges, deletes and the filter all have to keep a row.
     let ranges = Some(vec![(1u64, 10_001u64), (20_001, 30_002)]);
     let (batches, _) = read(task(&path, project, vec![delete], ranges), factory(3)).await;
-    assert_eq!(ids(&batches), vec![
-        2, 10_000, 20_001, 20_002, 30_000, 30_001
-    ]);
+    assert_eq!(
+        ids(&batches),
+        vec![2, 10_000, 20_001, 20_002, 30_000, 30_001]
+    );
     // The wide column of those rows is the file's own.
     let (all, _) = read(task(&path, vec![1, 2], vec![], None), None).await;
     let (all_ids, all_wide) = (ids(&all), wides(&all));

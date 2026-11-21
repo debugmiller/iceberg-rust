@@ -905,10 +905,13 @@ mod tests {
         string_vals.push(Some("BISON".to_string()));
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 
@@ -917,10 +920,13 @@ mod tests {
         let string_vals = vec![Some("DEER".to_string()); 1024];
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 
@@ -937,10 +943,13 @@ mod tests {
         }
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 
@@ -952,10 +961,13 @@ mod tests {
         let string_vals = vec![Some("HIPPO".to_string()); 1024];
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 
@@ -1748,10 +1760,10 @@ mod tests {
             iceberg_schema.as_ref(),
         )?;
 
-        assert_eq!(result, vec![
-            RowSelector::skip(2048),
-            RowSelector::select(2048)
-        ]);
+        assert_eq!(
+            result,
+            vec![RowSelector::skip(2048), RowSelector::select(2048)]
+        );
 
         Ok(())
     }
@@ -1778,12 +1790,15 @@ mod tests {
             iceberg_schema.as_ref(),
         )?;
 
-        assert_eq!(result, vec![
-            RowSelector::skip(1024),
-            RowSelector::select(1024),
-            RowSelector::skip(1024),
-            RowSelector::select(1024),
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                RowSelector::skip(1024),
+                RowSelector::select(1024),
+                RowSelector::skip(1024),
+                RowSelector::select(1024),
+            ]
+        );
 
         Ok(())
     }
@@ -1810,10 +1825,10 @@ mod tests {
             iceberg_schema.as_ref(),
         )?;
 
-        assert_eq!(result, vec![
-            RowSelector::skip(2048),
-            RowSelector::select(2048)
-        ]);
+        assert_eq!(
+            result,
+            vec![RowSelector::skip(2048), RowSelector::select(2048)]
+        );
 
         Ok(())
     }
@@ -1840,12 +1855,15 @@ mod tests {
             iceberg_schema.as_ref(),
         )?;
 
-        assert_eq!(result, vec![
-            RowSelector::skip(1024),
-            RowSelector::select(1024),
-            RowSelector::skip(1024),
-            RowSelector::select(1024),
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                RowSelector::skip(1024),
+                RowSelector::select(1024),
+                RowSelector::skip(1024),
+                RowSelector::select(1024),
+            ]
+        );
 
         Ok(())
     }
@@ -1872,10 +1890,10 @@ mod tests {
             iceberg_schema.as_ref(),
         )?;
 
-        assert_eq!(result, vec![
-            RowSelector::skip(1024),
-            RowSelector::select(3072)
-        ]);
+        assert_eq!(
+            result,
+            vec![RowSelector::skip(1024), RowSelector::select(3072)]
+        );
 
         Ok(())
     }

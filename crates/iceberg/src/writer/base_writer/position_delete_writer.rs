@@ -334,10 +334,13 @@ mod test {
     }
 
     fn position_delete_batch(paths: Vec<&str>, positions: Vec<i64>) -> RecordBatch {
-        RecordBatch::try_new(position_delete_arrow_schema(), vec![
-            Arc::new(StringArray::from(paths)),
-            Arc::new(Int64Array::from(positions)),
-        ])
+        RecordBatch::try_new(
+            position_delete_arrow_schema(),
+            vec![
+                Arc::new(StringArray::from(paths)),
+                Arc::new(Int64Array::from(positions)),
+            ],
+        )
         .unwrap()
     }
 
@@ -444,10 +447,13 @@ mod test {
             .iter()
             .map(|col| col.self_type().get_basic_info().id())
             .collect();
-        assert_eq!(field_ids, vec![
-            RESERVED_FIELD_ID_DELETE_FILE_PATH,
-            RESERVED_FIELD_ID_DELETE_FILE_POS,
-        ]);
+        assert_eq!(
+            field_ids,
+            vec![
+                RESERVED_FIELD_ID_DELETE_FILE_PATH,
+                RESERVED_FIELD_ID_DELETE_FILE_POS,
+            ]
+        );
 
         Ok(())
     }
@@ -528,9 +534,12 @@ mod test {
 
         // A batch carrying only the `file_path` column is not a position delete file.
         let arrow_schema = position_delete_arrow_schema();
-        let path_only = RecordBatch::try_new(Arc::new(arrow_schema.project(&[0]).unwrap()), vec![
-            Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
-        ])
+        let path_only = RecordBatch::try_new(
+            Arc::new(arrow_schema.project(&[0]).unwrap()),
+            vec![Arc::new(StringArray::from(vec![
+                "s3://bucket/data/f0.parquet",
+            ]))],
+        )
         .unwrap();
 
         let err = writer.write(path_only).await.unwrap_err();
@@ -555,10 +564,13 @@ mod test {
             Field::new(RESERVED_COL_NAME_DELETE_FILE_PATH, DataType::Utf8, false),
             Field::new(RESERVED_COL_NAME_DELETE_FILE_POS, DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(plain_schema, vec![
-            Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
-            Arc::new(Int64Array::from(vec![1_i64])),
-        ])
+        let batch = RecordBatch::try_new(
+            plain_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+            ],
+        )
         .unwrap();
 
         let err = writer.write(batch).await.unwrap_err();
@@ -587,10 +599,13 @@ mod test {
                 RESERVED_FIELD_ID_DELETE_FILE_POS,
             ),
         ]));
-        let batch = RecordBatch::try_new(bad_meta, vec![
-            Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
-            Arc::new(Int64Array::from(vec![1_i64])),
-        ])
+        let batch = RecordBatch::try_new(
+            bad_meta,
+            vec![
+                Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+            ],
+        )
         .unwrap();
 
         let err = writer.write(batch).await.unwrap_err();
@@ -618,10 +633,13 @@ mod test {
                 RESERVED_FIELD_ID_DELETE_FILE_PATH,
             ),
         ]));
-        let batch = RecordBatch::try_new(swapped, vec![
-            Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
-            Arc::new(Int64Array::from(vec![1_i64])),
-        ])
+        let batch = RecordBatch::try_new(
+            swapped,
+            vec![
+                Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+            ],
+        )
         .unwrap();
 
         let err = writer.write(batch).await.unwrap_err();
@@ -646,10 +664,13 @@ mod test {
             ),
             field_with_id(RESERVED_COL_NAME_DELETE_FILE_POS, DataType::Int64, 999),
         ]));
-        let batch = RecordBatch::try_new(wrong_pos_id, vec![
-            Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
-            Arc::new(Int64Array::from(vec![1_i64])),
-        ])
+        let batch = RecordBatch::try_new(
+            wrong_pos_id,
+            vec![
+                Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+            ],
+        )
         .unwrap();
         let err = writer.write(batch).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
@@ -664,10 +685,13 @@ mod test {
             ),
             Field::new(RESERVED_COL_NAME_DELETE_FILE_POS, DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(missing_pos_id, vec![
-            Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
-            Arc::new(Int64Array::from(vec![1_i64])),
-        ])
+        let batch = RecordBatch::try_new(
+            missing_pos_id,
+            vec![
+                Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+            ],
+        )
         .unwrap();
         let err = writer.write(batch).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
@@ -695,10 +719,13 @@ mod test {
                 RESERVED_FIELD_ID_DELETE_FILE_POS,
             ),
         ]));
-        let batch = RecordBatch::try_new(int32_pos, vec![
-            Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
-            Arc::new(Int32Array::from(vec![1_i32])),
-        ])
+        let batch = RecordBatch::try_new(
+            int32_pos,
+            vec![
+                Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
+                Arc::new(Int32Array::from(vec![1_i32])),
+            ],
+        )
         .unwrap();
         let err = writer.write(batch).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
@@ -717,10 +744,13 @@ mod test {
                 RESERVED_FIELD_ID_DELETE_FILE_POS,
             ),
         ]));
-        let batch = RecordBatch::try_new(int_path, vec![
-            Arc::new(Int32Array::from(vec![1_i32])),
-            Arc::new(Int64Array::from(vec![1_i64])),
-        ])
+        let batch = RecordBatch::try_new(
+            int_path,
+            vec![
+                Arc::new(Int32Array::from(vec![1_i32])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+            ],
+        )
         .unwrap();
         let err = writer.write(batch).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
@@ -740,10 +770,13 @@ mod test {
                 RESERVED_FIELD_ID_DELETE_FILE_POS,
             ),
         ]));
-        let batch = RecordBatch::try_new(large_path, vec![
-            Arc::new(LargeStringArray::from(vec!["s3://bucket/data/f0.parquet"])),
-            Arc::new(Int64Array::from(vec![1_i64])),
-        ])
+        let batch = RecordBatch::try_new(
+            large_path,
+            vec![
+                Arc::new(LargeStringArray::from(vec!["s3://bucket/data/f0.parquet"])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+            ],
+        )
         .unwrap();
         let err = writer.write(batch).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
@@ -779,10 +812,13 @@ mod test {
                 RESERVED_FIELD_ID_DELETE_FILE_POS,
             ),
         ]));
-        let batch = RecordBatch::try_new(nullable_path, vec![
-            Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
-            Arc::new(Int64Array::from(vec![1_i64])),
-        ])
+        let batch = RecordBatch::try_new(
+            nullable_path,
+            vec![
+                Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+            ],
+        )
         .unwrap();
         let err = writer.write(batch).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
@@ -804,10 +840,13 @@ mod test {
                 RESERVED_FIELD_ID_DELETE_FILE_POS,
             ),
         ]));
-        let batch = RecordBatch::try_new(nullable_pos, vec![
-            Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
-            Arc::new(Int64Array::from(vec![1_i64])),
-        ])
+        let batch = RecordBatch::try_new(
+            nullable_pos,
+            vec![
+                Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+            ],
+        )
         .unwrap();
         let err = writer.write(batch).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
@@ -855,9 +894,12 @@ mod test {
         // Even a malformed batch surfaces the closed error, not a validation error:
         // the closed check runs before validation.
         let arrow_schema = position_delete_arrow_schema();
-        let invalid = RecordBatch::try_new(Arc::new(arrow_schema.project(&[0]).unwrap()), vec![
-            Arc::new(StringArray::from(vec!["s3://bucket/data/f0.parquet"])),
-        ])
+        let invalid = RecordBatch::try_new(
+            Arc::new(arrow_schema.project(&[0]).unwrap()),
+            vec![Arc::new(StringArray::from(vec![
+                "s3://bucket/data/f0.parquet",
+            ]))],
+        )
         .unwrap();
         let invalid_err = writer.write(invalid).await.unwrap_err();
         assert_eq!(invalid_err.kind(), ErrorKind::Unexpected);

@@ -238,10 +238,13 @@ impl TransactionAction for RewriteFilesAction {
 
         snapshot_producer
             .with_removed_data_files(plan.deleted)
-            .commit(RewriteFilesOperation, RewriteManifestsProcess {
-                delete_paths: delete.iter().map(|p| p.to_string()).collect(),
-                affected_manifests: plan.affected_manifests,
-            })
+            .commit(
+                RewriteFilesOperation,
+                RewriteManifestsProcess {
+                    delete_paths: delete.iter().map(|p| p.to_string()).collect(),
+                    affected_manifests: plan.affected_manifests,
+                },
+            )
             .await
     }
 }

@@ -167,10 +167,7 @@ impl PositionDeletes {
     /// rather than repeating the path per row. The batch is built against the writer's shared
     /// Arrow projection (a cheap `Arc` clone) so the reserved field ids stay wired in. An
     /// exhausted `rows` yields a valid 0-row batch.
-    fn build_batch<'a, I>(
-        rows: &mut std::iter::Peekable<I>,
-        max_rows: usize,
-    ) -> Result<RecordBatch>
+    fn build_batch<'a, I>(rows: &mut std::iter::Peekable<I>, max_rows: usize) -> Result<RecordBatch>
     where
         I: Iterator<Item = (&'a str, u64)>,
     {
@@ -205,10 +202,13 @@ impl PositionDeletes {
         }
 
         let schema = super::position_delete_writer::position_delete_arrow_schema();
-        RecordBatch::try_new(schema, vec![
-            Arc::new(path_builder.finish()) as ArrayRef,
-            Arc::new(pos_builder.finish()) as ArrayRef,
-        ])
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(path_builder.finish()) as ArrayRef,
+                Arc::new(pos_builder.finish()) as ArrayRef,
+            ],
+        )
         .map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -307,11 +307,14 @@ mod test {
 
         let batch = deletes.to_record_batch().unwrap();
         let (paths, positions) = columns(&batch);
-        assert_eq!(paths, vec![
-            "s3://bucket/data/f0.parquet",
-            "s3://bucket/data/f0.parquet",
-            "s3://bucket/data/f1.parquet",
-        ]);
+        assert_eq!(
+            paths,
+            vec![
+                "s3://bucket/data/f0.parquet",
+                "s3://bucket/data/f0.parquet",
+                "s3://bucket/data/f1.parquet",
+            ]
+        );
         assert_eq!(positions, vec![1, 4, 2]);
     }
 
@@ -330,10 +333,10 @@ mod test {
         let batch = deletes.to_record_batch().unwrap();
         let (paths, positions) = columns(&batch);
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(paths, vec![
-            "s3://bucket/data/f0.parquet",
-            "s3://bucket/data/f0.parquet",
-        ]);
+        assert_eq!(
+            paths,
+            vec!["s3://bucket/data/f0.parquet", "s3://bucket/data/f0.parquet",]
+        );
         assert_eq!(positions, vec![1, 3]);
     }
 
@@ -457,14 +460,17 @@ mod test {
         let (whole_paths, whole_positions) = columns(&deletes.to_record_batch().unwrap());
         assert_eq!(flat_paths, whole_paths);
         assert_eq!(flat_positions, whole_positions);
-        assert_eq!(whole_paths, vec![
-            "s3://bucket/data/f0.parquet",
-            "s3://bucket/data/f0.parquet",
-            "s3://bucket/data/f0.parquet",
-            "s3://bucket/data/f1.parquet",
-            "s3://bucket/data/f1.parquet",
-            "s3://bucket/data/f2.parquet",
-        ]);
+        assert_eq!(
+            whole_paths,
+            vec![
+                "s3://bucket/data/f0.parquet",
+                "s3://bucket/data/f0.parquet",
+                "s3://bucket/data/f0.parquet",
+                "s3://bucket/data/f1.parquet",
+                "s3://bucket/data/f1.parquet",
+                "s3://bucket/data/f2.parquet",
+            ]
+        );
         assert_eq!(whole_positions, vec![1, 4, 7, 2, 5, 9]);
     }
 
@@ -556,10 +562,10 @@ mod test {
         // The duplicate collapses, so a generous batch holds just the two distinct rows.
         let batches = batched_columns(&deletes, 100);
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].0, vec![
-            "s3://bucket/data/f0.parquet",
-            "s3://bucket/data/f0.parquet",
-        ]);
+        assert_eq!(
+            batches[0].0,
+            vec!["s3://bucket/data/f0.parquet", "s3://bucket/data/f0.parquet",]
+        );
         assert_eq!(batches[0].1, vec![1, 3]);
     }
 
@@ -576,13 +582,16 @@ mod test {
         let batches = batched_columns(&deletes, 100);
         assert_eq!(batches.len(), 1);
         let (paths, positions) = &batches[0];
-        assert_eq!(paths, &vec![
-            "s3://bucket/data/f0.parquet",
-            "s3://bucket/data/f0.parquet",
-            "s3://bucket/data/f0.parquet",
-            "s3://bucket/data/f0.parquet",
-            "s3://bucket/data/f1.parquet",
-        ]);
+        assert_eq!(
+            paths,
+            &vec![
+                "s3://bucket/data/f0.parquet",
+                "s3://bucket/data/f0.parquet",
+                "s3://bucket/data/f0.parquet",
+                "s3://bucket/data/f0.parquet",
+                "s3://bucket/data/f1.parquet",
+            ]
+        );
         assert_eq!(positions, &vec![1, 2, 3, 4, 8]);
     }
 

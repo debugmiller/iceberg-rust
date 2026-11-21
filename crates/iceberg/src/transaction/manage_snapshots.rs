@@ -156,9 +156,12 @@ impl TransactionAction for ManageSnapshotsAction {
                     requirements.push(requirement);
                     updates.push(TableUpdate::SetSnapshotRef {
                         ref_name: name.clone(),
-                        reference: SnapshotReference::new(*snapshot_id, SnapshotRetention::Tag {
-                            max_ref_age_ms: None,
-                        }),
+                        reference: SnapshotReference::new(
+                            *snapshot_id,
+                            SnapshotRetention::Tag {
+                                max_ref_age_ms: None,
+                            },
+                        ),
                     });
                 }
                 RefChange::RemoveTag { name } => {
@@ -256,9 +259,12 @@ mod tests {
         let table = tag(&catalog, &table, "cut", first).await.unwrap();
         let reference = table.metadata().refs().get("cut").unwrap();
         assert_eq!(reference.snapshot_id, first);
-        assert_eq!(reference.retention, SnapshotRetention::Tag {
-            max_ref_age_ms: None
-        });
+        assert_eq!(
+            reference.retention,
+            SnapshotRetention::Tag {
+                max_ref_age_ms: None
+            }
+        );
         // main is untouched.
         assert_ne!(current(&table), first);
         let reloaded = catalog.load_table(table.identifier()).await.unwrap();

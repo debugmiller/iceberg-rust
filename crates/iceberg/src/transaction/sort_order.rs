@@ -200,20 +200,23 @@ mod tests {
             .downcast_ref::<ReplaceSortOrderAction>()
             .unwrap();
 
-        assert_eq!(replace_sort_order.pending_sort_fields, vec![
-            PendingSortField {
-                name: String::from("x"),
-                transform: Transform::Identity,
-                direction: SortDirection::Ascending,
-                null_order: NullOrder::First,
-            },
-            PendingSortField {
-                name: String::from("y"),
-                transform: Transform::Identity,
-                direction: SortDirection::Descending,
-                null_order: NullOrder::Last,
-            }
-        ]);
+        assert_eq!(
+            replace_sort_order.pending_sort_fields,
+            vec![
+                PendingSortField {
+                    name: String::from("x"),
+                    transform: Transform::Identity,
+                    direction: SortDirection::Ascending,
+                    null_order: NullOrder::First,
+                },
+                PendingSortField {
+                    name: String::from("y"),
+                    transform: Transform::Identity,
+                    direction: SortDirection::Descending,
+                    null_order: NullOrder::Last,
+                }
+            ]
+        );
     }
 
     #[test]
@@ -232,20 +235,23 @@ mod tests {
             .downcast_ref::<ReplaceSortOrderAction>()
             .unwrap();
 
-        assert_eq!(replace_sort_order.pending_sort_fields, vec![
-            PendingSortField {
-                name: String::from("x"),
-                transform: Transform::Bucket(16),
-                direction: SortDirection::Ascending,
-                null_order: NullOrder::First,
-            },
-            PendingSortField {
-                name: String::from("y"),
-                transform: Transform::Truncate(4),
-                direction: SortDirection::Descending,
-                null_order: NullOrder::Last,
-            }
-        ]);
+        assert_eq!(
+            replace_sort_order.pending_sort_fields,
+            vec![
+                PendingSortField {
+                    name: String::from("x"),
+                    transform: Transform::Bucket(16),
+                    direction: SortDirection::Ascending,
+                    null_order: NullOrder::First,
+                },
+                PendingSortField {
+                    name: String::from("y"),
+                    transform: Transform::Truncate(4),
+                    direction: SortDirection::Descending,
+                    null_order: NullOrder::Last,
+                }
+            ]
+        );
     }
 
     #[tokio::test]

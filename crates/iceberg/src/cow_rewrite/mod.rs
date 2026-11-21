@@ -556,10 +556,10 @@ mod tests {
                     Some(value)
                 }
             }));
-            let output = RecordBatch::try_new(batch.schema(), vec![
-                batch.column(0).clone(),
-                Arc::new(updated_values),
-            ])
+            let output = RecordBatch::try_new(
+                batch.schema(),
+                vec![batch.column(0).clone(), Arc::new(updated_values)],
+            )
             .map_err(|err| Error::new(ErrorKind::Unexpected, err.to_string()))?;
 
             Ok(CowBatchRewrite {
@@ -608,9 +608,10 @@ mod tests {
                 "1".to_string(),
             )])),
         ]));
-        let batch = RecordBatch::try_new(arrow_schema, vec![
-            Arc::new(Int32Array::from(ids)) as ArrayRef
-        ])?;
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(ids)) as ArrayRef],
+        )?;
         let data_files = super::writer::write_replacement_batches(
             &table,
             table.metadata().current_schema().clone(),
@@ -668,9 +669,10 @@ mod tests {
             )])),
         ]));
         let input = batches.into_iter().map(|ids| {
-            Ok(RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Int32Array::from(ids)) as ArrayRef,
-            ])?)
+            Ok(RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)) as ArrayRef],
+            )?)
         });
         let data_files = super::writer::write_replacement_batches(
             &table,
@@ -731,10 +733,13 @@ mod tests {
         ]));
         let ids = rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         let values = rows.iter().map(|(_, value)| *value).collect::<Vec<_>>();
-        let batch = RecordBatch::try_new(arrow_schema, vec![
-            Arc::new(Int32Array::from(ids)) as ArrayRef,
-            Arc::new(Int32Array::from(values)) as ArrayRef,
-        ])?;
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(Int32Array::from(values)) as ArrayRef,
+            ],
+        )?;
         let data_files = super::writer::write_replacement_batches(
             &table,
             table.metadata().current_schema().clone(),
@@ -1236,9 +1241,10 @@ mod tests {
                 "1".to_string(),
             )])),
         ]));
-        let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(vec![
-            1, 2, 3, 4,
-        ])) as ArrayRef])?;
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef],
+        )?;
         let data_files = super::writer::write_replacement_batches(
             &table,
             table.metadata().current_schema().clone(),
@@ -1333,9 +1339,10 @@ mod tests {
         let input = vec![vec![1, 2, 3, 4], vec![100, 101, 102, 103]]
             .into_iter()
             .map(|ids| {
-                Ok(RecordBatch::try_new(arrow_schema.clone(), vec![
-                    Arc::new(Int32Array::from(ids)) as ArrayRef,
-                ])?)
+                Ok(RecordBatch::try_new(
+                    arrow_schema.clone(),
+                    vec![Arc::new(Int32Array::from(ids)) as ArrayRef],
+                )?)
             });
         let data_files = super::writer::write_replacement_batches(
             &table,
@@ -1450,10 +1457,13 @@ mod tests {
         let current_schema = table.metadata().current_schema().clone();
         let default_spec = table.metadata().default_partition_spec().as_ref().clone();
 
-        let batch_one = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![1, 1])),
-        ])?;
+        let batch_one = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![1, 1])),
+            ],
+        )?;
         let one_partition = crate::spec::PartitionKey::new(
             default_spec.clone(),
             current_schema.clone(),
@@ -1467,10 +1477,13 @@ mod tests {
         )
         .await?;
 
-        let batch_null = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![None::<i32>, None])),
-        ])?;
+        let batch_null = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![None::<i32>, None])),
+            ],
+        )?;
         let null_partition = crate::spec::PartitionKey::new(
             default_spec.clone(),
             current_schema.clone(),
@@ -1559,10 +1572,10 @@ mod tests {
                 .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "value must be Int32"))?;
             let updated =
                 Int32Array::from_iter((0..values.len()).map(|row| Some(values.value(row) + 100)));
-            let output = RecordBatch::try_new(batch.schema(), vec![
-                batch.column(0).clone(),
-                Arc::new(updated),
-            ])
+            let output = RecordBatch::try_new(
+                batch.schema(),
+                vec![batch.column(0).clone(), Arc::new(updated)],
+            )
             .map_err(|err| Error::new(ErrorKind::Unexpected, err.to_string()))?;
 
             Ok(CowBatchRewrite {
@@ -1627,10 +1640,13 @@ mod tests {
                 "2".to_string(),
             )])),
         ]));
-        let batch = RecordBatch::try_new(arrow_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![1, 1])),
-        ])
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![1, 1])),
+            ],
+        )
         .unwrap();
         let partition_key = crate::spec::PartitionKey::new(
             table.metadata().default_partition_spec().as_ref().clone(),

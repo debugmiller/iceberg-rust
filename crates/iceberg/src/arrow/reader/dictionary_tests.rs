@@ -84,10 +84,13 @@ fn write_file(dir: &TempDir, dictionary: bool, bloom: bool) -> String {
         with_id("id", DataType::Int32, false, 1),
         with_id("s", DataType::Utf8, true, 2),
     ]));
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        Arc::new(Int32Array::from_iter_values(0..ROWS)),
-        Arc::new(StringArray::from((0..ROWS).map(value).collect::<Vec<_>>())),
-    ])
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..ROWS)),
+            Arc::new(StringArray::from((0..ROWS).map(value).collect::<Vec<_>>())),
+        ],
+    )
     .unwrap();
     let mut props = WriterProperties::builder().set_max_row_group_row_count(Some(GROUP_ROWS));
     if !dictionary {
@@ -367,10 +370,13 @@ fn write_positional_delete(
         with_id("file_path", DataType::Utf8, false, 2147483546),
         with_id("pos", DataType::Int64, false, 2147483545),
     ]));
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        Arc::new(StringArray::from(vec![data_path; positions.len()])),
-        Arc::new(Int64Array::from(positions.to_vec())),
-    ])
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![data_path; positions.len()])),
+            Arc::new(Int64Array::from(positions.to_vec())),
+        ],
+    )
     .unwrap();
     let path = format!("{}/posdel.parquet", dir.path().to_str().unwrap());
     let mut writer =

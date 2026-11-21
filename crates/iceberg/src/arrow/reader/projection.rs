@@ -1133,9 +1133,10 @@ message schema {
         let col3_data = Arc::new(StringArray::from(vec!["c", "d"])) as ArrayRef;
         let col4_data = Arc::new(Int32Array::from(vec![30, 40])) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            col1_data, col2_data, col3_data, col4_data,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![col1_data, col2_data, col3_data, col4_data],
+        )
         .unwrap();
 
         let props = WriterProperties::builder()

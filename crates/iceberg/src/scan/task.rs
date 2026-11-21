@@ -579,7 +579,9 @@ mod _serde {
 
     impl Serialize for FileScanTask {
         fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-        where S: serde::Serializer {
+        where
+            S: serde::Serializer,
+        {
             FileScanTaskRefSerde::try_from(self)
                 .map_err(serde::ser::Error::custom)?
                 .serialize(serializer)

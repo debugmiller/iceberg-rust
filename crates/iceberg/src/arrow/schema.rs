@@ -176,7 +176,9 @@ pub trait ArrowSchemaVisitor {
     /// Takes the `&FieldRef` rather than a `&DataType` because the variant signal
     /// lives on the field's metadata, not on its data type.
     fn variant(&mut self, field: &FieldRef) -> Result<Self::T>
-    where Self: Sized {
+    where
+        Self: Sized,
+    {
         visit_type(field.data_type(), self)
     }
 }

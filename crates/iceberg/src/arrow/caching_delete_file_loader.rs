@@ -905,11 +905,11 @@ mod tests {
             true,
             "3",
         )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![
-                Arc::new(StringArray::from(vec![Some("INACTIVE")])) as ArrayRef,
-            ])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some("INACTIVE")])) as ArrayRef],
+        )
+        .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
         let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
@@ -935,9 +935,10 @@ mod tests {
             true,
             "3",
         )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![
-            None as Option<&str>,
-        ])) as ArrayRef])
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef],
+        )
         .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
@@ -959,10 +960,13 @@ mod tests {
             simple_field("id", DataType::Int64, true, "1"),
             simple_field("status", DataType::Utf8, true, "3"),
         ]));
-        let batch = RecordBatch::try_new(schema, vec![
-            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-            Arc::new(StringArray::from(vec![Some("X")])) as ArrayRef,
-        ])
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("X")])) as ArrayRef,
+            ],
+        )
         .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
@@ -989,10 +993,10 @@ mod tests {
             true,
             "3",
         )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![
-            Some("A"),
-            Some("B"),
-        ])) as ArrayRef])
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some("A"), Some("B")])) as ArrayRef],
+        )
         .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
@@ -1066,9 +1070,10 @@ mod tests {
             Arc::new(arrow_schema::Schema::new(fields))
         };
 
-        let equality_deletes_to_write = RecordBatch::try_new(equality_delete_schema.clone(), vec![
-            col_y, col_z, col_a, col_s, col_b,
-        ])
+        let equality_deletes_to_write = RecordBatch::try_new(
+            equality_delete_schema.clone(),
+            vec![col_y, col_z, col_a, col_s, col_b],
+        )
         .unwrap();
 
         let path = format!("{}/equality-deletes-1.parquet", &table_location);
@@ -1159,15 +1164,21 @@ mod tests {
     async fn test_parse_positional_deletes_merges_sorted_runs() {
         let schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
 
-        let batch1 = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec!["a", "a", "a", "b"])),
-            Arc::new(Int64Array::from_iter_values(vec![1i64, 3, 5, 2])),
-        ])
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec!["a", "a", "a", "b"])),
+                Arc::new(Int64Array::from_iter_values(vec![1i64, 3, 5, 2])),
+            ],
+        )
         .unwrap();
-        let batch2 = RecordBatch::try_new(schema, vec![
-            Arc::new(StringArray::from_iter_values(vec!["b", "c"])),
-            Arc::new(Int64Array::from_iter_values(vec![4i64, 0])),
-        ])
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from_iter_values(vec!["b", "c"])),
+                Arc::new(Int64Array::from_iter_values(vec![4i64, 0])),
+            ],
+        )
         .unwrap();
         let stream = futures::stream::iter(vec![Ok(batch1), Ok(batch2)]).boxed();
 
@@ -1190,10 +1201,13 @@ mod tests {
     async fn test_parse_positional_deletes_merges_spec_noncompliant_unsorted_runs() {
         let schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
 
-        let batch = RecordBatch::try_new(schema, vec![
-            Arc::new(StringArray::from_iter_values(vec!["a", "b", "a"])),
-            Arc::new(Int64Array::from_iter_values(vec![3i64, 2, 1])),
-        ])
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from_iter_values(vec!["a", "b", "a"])),
+                Arc::new(Int64Array::from_iter_values(vec![3i64, 2, 1])),
+            ],
+        )
         .unwrap();
         let stream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
@@ -1214,15 +1228,21 @@ mod tests {
     async fn test_parse_positional_deletes_merges_overlapping_cross_batch_runs() {
         let schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
 
-        let batch1 = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec!["a", "a"])),
-            Arc::new(Int64Array::from_iter_values(vec![5i64, 10])),
-        ])
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec!["a", "a"])),
+                Arc::new(Int64Array::from_iter_values(vec![5i64, 10])),
+            ],
+        )
         .unwrap();
-        let batch2 = RecordBatch::try_new(schema, vec![
-            Arc::new(StringArray::from_iter_values(vec!["a", "a"])),
-            Arc::new(Int64Array::from_iter_values(vec![3i64, 7])),
-        ])
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from_iter_values(vec!["a", "a"])),
+                Arc::new(Int64Array::from_iter_values(vec![3i64, 7])),
+            ],
+        )
         .unwrap();
         let stream = futures::stream::iter(vec![Ok(batch1), Ok(batch2)]).boxed();
 
@@ -1242,10 +1262,13 @@ mod tests {
     async fn test_parse_positional_deletes_merges_duplicate_positions() {
         let schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
 
-        let batch = RecordBatch::try_new(schema, vec![
-            Arc::new(StringArray::from_iter_values(vec!["a", "a", "a"])),
-            Arc::new(Int64Array::from_iter_values(vec![3i64, 3, 7])),
-        ])
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from_iter_values(vec!["a", "a", "a"])),
+                Arc::new(Int64Array::from_iter_values(vec![3i64, 3, 7])),
+            ],
+        )
         .unwrap();
         let stream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
@@ -1376,12 +1399,11 @@ mod tests {
         let file_path_col = Arc::new(StringArray::from_iter_values(&file_path_values));
         let pos_col = Arc::new(Int64Array::from_iter_values(vec![0i64, 1, 2, 3]));
 
-        let positional_deletes_to_write =
-            RecordBatch::try_new(positional_delete_schema.clone(), vec![
-                file_path_col,
-                pos_col,
-            ])
-            .unwrap();
+        let positional_deletes_to_write = RecordBatch::try_new(
+            positional_delete_schema.clone(),
+            vec![file_path_col, pos_col],
+        )
+        .unwrap();
 
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)

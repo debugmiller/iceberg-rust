@@ -944,10 +944,10 @@ mod tests {
         let fields = mapping.fields();
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].field_id(), Some(1));
-        assert_eq!(fields[0].names(), &[
-            "id".to_string(),
-            "record_id".to_string()
-        ]);
+        assert_eq!(
+            fields[0].names(),
+            &["id".to_string(), "record_id".to_string()]
+        );
     }
 
     #[test]
@@ -2622,14 +2622,17 @@ mod tests {
         .unwrap()
         .add_snapshot(snapshot)
         .unwrap()
-        .set_ref(MAIN_BRANCH, SnapshotReference {
-            snapshot_id: 1,
-            retention: SnapshotRetention::Branch {
-                min_snapshots_to_keep: None,
-                max_snapshot_age_ms: None,
-                max_ref_age_ms: None,
+        .set_ref(
+            MAIN_BRANCH,
+            SnapshotReference {
+                snapshot_id: 1,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
             },
-        })
+        )
         .unwrap()
         .build()
         .unwrap()

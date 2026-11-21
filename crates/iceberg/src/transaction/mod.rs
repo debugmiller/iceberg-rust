@@ -56,6 +56,7 @@ pub use action::*;
 mod append;
 mod expire_snapshots;
 mod manage_snapshots;
+mod remove_schemas;
 mod rewrite_files;
 mod snapshot;
 mod sort_order;
@@ -78,6 +79,7 @@ use crate::transaction::action::BoxedTransactionAction;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 pub use crate::transaction::manage_snapshots::ManageSnapshotsAction;
+pub use crate::transaction::remove_schemas::RemoveSchemasAction;
 pub use crate::transaction::rewrite_files::RewriteFilesAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
@@ -163,6 +165,11 @@ impl Transaction {
     /// Creates replace sort order action.
     pub fn replace_sort_order(&self) -> ReplaceSortOrderAction {
         ReplaceSortOrderAction::new()
+    }
+
+    /// Removes every schema of the table but its current one.
+    pub fn remove_schemas(&self) -> RemoveSchemasAction {
+        RemoveSchemasAction::new()
     }
 
     /// Set the location of table

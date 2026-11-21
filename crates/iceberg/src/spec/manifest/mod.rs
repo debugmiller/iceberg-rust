@@ -1862,9 +1862,13 @@ mod tests {
             {"name": "extra", "type": ["null", "int"], "default": null, "field-id": 1003},
             {"name": "id", "type": ["null", "long"], "default": null, "field-id": 1000},
         ]));
-        let bs = write_with_writer_schema(&metadata, &writer_schema, vec![v2_entry(
-            serde_json::json!({"score": 2.5, "extra": 9, "id": 5}),
-        )]);
+        let bs = write_with_writer_schema(
+            &metadata,
+            &writer_schema,
+            vec![v2_entry(
+                serde_json::json!({"score": 2.5, "extra": 9, "id": 5}),
+            )],
+        );
 
         let manifest = Manifest::parse_avro(&bs).unwrap();
 
@@ -1889,9 +1893,13 @@ mod tests {
             writer_schema_field(&mut writer_schema, &["data_file", field])["type"] =
                 serde_json::json!("int");
         }
-        let bs = write_with_writer_schema(&metadata, &writer_schema, vec![v2_entry(
-            serde_json::json!({"id": 5, "name": "a", "score": 2.5}),
-        )]);
+        let bs = write_with_writer_schema(
+            &metadata,
+            &writer_schema,
+            vec![v2_entry(
+                serde_json::json!({"id": 5, "name": "a", "score": 2.5}),
+            )],
+        );
 
         let manifest = Manifest::parse_avro(&bs).unwrap();
 

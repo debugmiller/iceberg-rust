@@ -36,9 +36,8 @@ use super::metadata_cache::MetadataKey;
 use super::row_lineage::synthesize_row_id_column;
 use super::{
     ArrowFileReader, ArrowReader, ParquetMetadataCache, ParquetReadOptions, RowFilterFactory,
-    VariantLeafSelector,
-    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
-    find_leaf_by_field_id,
+    VariantLeafSelector, add_fallback_field_ids_to_arrow_schema,
+    apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -459,20 +458,19 @@ impl FileScanTaskReader {
         // - If name mapping applied: field-ID-based projection using the IDs the name
         //   mapping assigned to the Arrow schema
         // - Otherwise: position-based fallback projection
-        let mut projection_mask = if project_field_ids_without_metadata.is_empty()
-            && !raw_variants.is_empty()
-        {
-            // Nothing but the raw columns' leaves (an empty list of ids would mean every column).
-            ProjectionMask::none(record_batch_stream_builder.parquet_schema().num_columns())
-        } else {
-            ArrowReader::get_arrow_projection_mask(
-                &project_field_ids_without_metadata,
-                task.schema(),
-                record_batch_stream_builder.parquet_schema(),
-                record_batch_stream_builder.schema(),
-                use_position_fallback, // Whether to use position-based (true) or field-ID-based (false) projection
-            )?
-        };
+        let mut projection_mask =
+            if project_field_ids_without_metadata.is_empty() && !raw_variants.is_empty() {
+                // Nothing but the raw columns' leaves (an empty list of ids would mean every column).
+                ProjectionMask::none(record_batch_stream_builder.parquet_schema().num_columns())
+            } else {
+                ArrowReader::get_arrow_projection_mask(
+                    &project_field_ids_without_metadata,
+                    task.schema(),
+                    record_batch_stream_builder.parquet_schema(),
+                    record_batch_stream_builder.schema(),
+                    use_position_fallback, // Whether to use position-based (true) or field-ID-based (false) projection
+                )?
+            };
         for raw in &raw_variants {
             projection_mask.union(&ProjectionMask::leaves(
                 record_batch_stream_builder.parquet_schema(),
@@ -1832,10 +1830,12 @@ mod tests {
             true,
         );
         let seq_col = Arc::new(Int64Array::from(vec![Some(5), None, Some(8)])) as ArrayRef;
-        let file_path =
-            write_plain_parquet(dir, "with_seq_by_name.parquet", vec![seq_field], vec![
-                seq_col,
-            ]);
+        let file_path = write_plain_parquet(
+            dir,
+            "with_seq_by_name.parquet",
+            vec![seq_field],
+            vec![seq_col],
+        );
 
         let task = last_updated_seq_task(file_path, Some(100), Some(9));
 
@@ -2619,9 +2619,10 @@ mod tests {
             "1".to_string(),
         )]));
         let arrow_schema = Arc::new(ArrowSchema::new(vec![field]));
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            vec![1, 2, 3, 4, 5],
-        ))])
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+        )
         .unwrap();
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
@@ -2663,9 +2664,10 @@ mod tests {
             "1".to_string(),
         )]));
         let arrow_schema = Arc::new(ArrowSchema::new(vec![field]));
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            vec![1, 2, 3, 4, 5, 6],
-        ))])
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+        )
         .unwrap();
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
@@ -2723,10 +2725,13 @@ mod tests {
             "2147483545".to_string(),
         )]));
         let arrow_schema = Arc::new(ArrowSchema::new(vec![file_path_field, pos_field]));
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(StringArray::from(vec![data_file_path; positions.len()])),
-            Arc::new(Int64Array::from(positions.to_vec())),
-        ])
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![data_file_path; positions.len()])),
+                Arc::new(Int64Array::from(positions.to_vec())),
+            ],
+        )
         .unwrap();
 
         let path = format!("{dir}/{name}");
@@ -2790,10 +2795,13 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new(RESERVED_COL_NAME_ROW_ID, DataType::Int64, true),
         ]));
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(Int64Array::from(vec![7i64, 8, 9])),
-        ])
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![7i64, 8, 9])),
+            ],
+        )
         .unwrap();
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
@@ -3708,10 +3716,11 @@ mod tests {
         // The motivating row-lineage shape: a synthesized position column (mask -> none)
         // alongside a materialized per-file constant.
         let file_path = write_parquet_with_wide_column(dir, "pos_and_file.parquet", vec![], vec![]);
-        let task = metadata_projection_task(file_path.clone(), id_and_wide_schema(), vec![
-            RESERVED_FIELD_ID_POS,
-            RESERVED_FIELD_ID_FILE,
-        ]);
+        let task = metadata_projection_task(
+            file_path.clone(),
+            id_and_wide_schema(),
+            vec![RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_FILE],
+        );
         let (batches, _) = scan_task(task).await;
 
         // Both metadata columns materialize; no data column is read.
@@ -3768,10 +3777,13 @@ mod tests {
                 .unwrap()
         };
 
-        let meta_only = seq_task(write("pos_seq.parquet"), vec![
-            RESERVED_FIELD_ID_POS,
-            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-        ]);
+        let meta_only = seq_task(
+            write("pos_seq.parquet"),
+            vec![
+                RESERVED_FIELD_ID_POS,
+                RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+            ],
+        );
         let (batches, meta_only_bytes) = scan_task(meta_only).await;
 
         // `_pos` and the coalesced sequence column materialize; the wide column does not.
@@ -3793,11 +3805,14 @@ mod tests {
 
         // A scan that also projects the wide data column must read materially more,
         // proving the metadata-only scan pruned to just the sequence leaf.
-        let with_data = seq_task(write("pos_seq_ref.parquet"), vec![
-            2,
-            RESERVED_FIELD_ID_POS,
-            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-        ]);
+        let with_data = seq_task(
+            write("pos_seq_ref.parquet"),
+            vec![
+                2,
+                RESERVED_FIELD_ID_POS,
+                RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+            ],
+        );
         let (_, with_data_bytes) = scan_task(with_data).await;
 
         assert!(
@@ -3843,9 +3858,10 @@ mod tests {
                 .unwrap()
         };
 
-        let meta_only = seq_task(write("seq_only.parquet"), vec![
-            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-        ]);
+        let meta_only = seq_task(
+            write("seq_only.parquet"),
+            vec![RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER],
+        );
         let (batches, meta_only_bytes) = scan_task(meta_only).await;
 
         let seq_col = batches[0]
@@ -3860,10 +3876,10 @@ mod tests {
         assert_eq!(total_rows, 3);
         assert!(batches[0].column_by_name("wide").is_none());
 
-        let with_data = seq_task(write("seq_only_ref.parquet"), vec![
-            2,
-            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-        ]);
+        let with_data = seq_task(
+            write("seq_only_ref.parquet"),
+            vec![2, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER],
+        );
         let (_, with_data_bytes) = scan_task(with_data).await;
 
         assert!(
@@ -3908,9 +3924,10 @@ mod tests {
                 .unwrap()
         };
 
-        let meta_only = seq_task("seq_only_null_first.parquet", vec![
-            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-        ]);
+        let meta_only = seq_task(
+            "seq_only_null_first.parquet",
+            vec![RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER],
+        );
         let (batches, meta_only_bytes) = scan_task(meta_only).await;
 
         assert_eq!(batches[0].num_columns(), 1);
@@ -3923,10 +3940,10 @@ mod tests {
         let seq_col = seq_col.as_any().downcast_ref::<Int64Array>().unwrap();
         assert!((0..3).all(|i| seq_col.is_null(i)));
 
-        let with_data = seq_task("seq_only_null_first_ref.parquet", vec![
-            2,
-            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-        ]);
+        let with_data = seq_task(
+            "seq_only_null_first_ref.parquet",
+            vec![2, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER],
+        );
         let (_, with_data_bytes) = scan_task(with_data).await;
 
         assert!(
@@ -3947,9 +3964,11 @@ mod tests {
         let dir = tmp_dir.path().to_str().unwrap();
 
         let file_path = write_parquet_with_wide_column(dir, "file_only.parquet", vec![], vec![]);
-        let meta_only = metadata_projection_task(file_path.clone(), id_and_wide_schema(), vec![
-            RESERVED_FIELD_ID_FILE,
-        ]);
+        let meta_only = metadata_projection_task(
+            file_path.clone(),
+            id_and_wide_schema(),
+            vec![RESERVED_FIELD_ID_FILE],
+        );
         let (batches, meta_only_bytes) = scan_task(meta_only).await;
 
         assert_eq!(batches[0].num_columns(), 1);

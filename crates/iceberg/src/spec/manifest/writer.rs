@@ -889,10 +889,10 @@ mod tests {
         // it has `logicalType: map`. apache-avro 0.22 drops the attribute when it
         // parses a schema (https://github.com/apache/avro-rs/issues/654), so this
         // checks the schema JSON in the written header.
-        let bs = roundtrip_two_partition_fields_of_type(Type::Primitive(PrimitiveType::Int), [
-            Literal::int(1),
-            Literal::int(2),
-        ])
+        let bs = roundtrip_two_partition_fields_of_type(
+            Type::Primitive(PrimitiveType::Int),
+            [Literal::int(1), Literal::int(2)],
+        )
         .await;
 
         let file = String::from_utf8_lossy(&bs);
@@ -915,10 +915,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_manifest_with_repeated_fixed_partition_type() {
-        roundtrip_two_partition_fields_of_type(Type::Primitive(PrimitiveType::Fixed(4)), [
-            Literal::fixed(vec![1, 2, 3, 4]),
-            Literal::fixed(vec![5, 6, 7, 8]),
-        ])
+        roundtrip_two_partition_fields_of_type(
+            Type::Primitive(PrimitiveType::Fixed(4)),
+            [
+                Literal::fixed(vec![1, 2, 3, 4]),
+                Literal::fixed(vec![5, 6, 7, 8]),
+            ],
+        )
         .await;
     }
 }

@@ -192,9 +192,10 @@ mod tests {
                 "1".to_string(),
             )])),
         ]));
-        let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(vec![
-            1, 2, 3,
-        ])) as ArrayRef])?;
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
+        )?;
 
         let data_files = write_replacement_batches(
             &table,
@@ -288,10 +289,10 @@ mod tests {
                 "1".to_string(),
             )])),
         ]));
-        let batch =
-            RecordBatch::try_new(arrow_schema, vec![
-                Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef,
-            ])?;
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef],
+        )?;
 
         let data_files = write_replacement_batches(
             &table,
@@ -348,9 +349,10 @@ mod tests {
                 "1".to_string(),
             )])),
         ]));
-        let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(vec![
-            1, 2, 3,
-        ])) as ArrayRef])?;
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
+        )?;
 
         let data_files = write_replacement_batches(
             &table,
@@ -418,9 +420,10 @@ mod tests {
                 "1".to_string(),
             )])),
         ]));
-        let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(vec![
-            1, 1, 1,
-        ])) as ArrayRef])?;
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 1, 1])) as ArrayRef],
+        )?;
         let partition_key = PartitionKey::new(
             table.metadata().default_partition_spec().as_ref().clone(),
             table.metadata().current_schema().clone(),
